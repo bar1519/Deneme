@@ -4,6 +4,7 @@ from docx import Document
 from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 import io
+import base64
 from datetime import datetime
 from openai import OpenAI
 from reportlab.lib.pagesizes import A4
@@ -56,6 +57,10 @@ def get_secret_int(name: str, default: int) -> int:
         return default
 
 
+VISION_MODEL = get_secret("VISION_MODEL", "meta/llama-3.2-11b-vision-instruct")
+VISION_API_KEY = get_secret("VISION_API_KEY") or get_secret("AGENT1_API_KEY")
+VISION_MAX_IMAGES = get_secret_int("VISION_MAX_IMAGES", 8)
+
 # Her ajan: kendi API key + model + parametreler (Secrets)
 # 1: Llama 3.1 70B | 2: DeepSeek V4 Pro | 3: Mistral Large
 AGENT_CONFIG = {
@@ -65,7 +70,7 @@ AGENT_CONFIG = {
         "model": get_secret("AGENT1_MODEL", "meta/llama-3.1-70b-instruct"),
         "temperature": get_secret_float("AGENT1_TEMPERATURE", 0.2),
         "top_p": get_secret_float("AGENT1_TOP_P", 0.7),
-        "max_tokens": get_secret_int("AGENT1_MAX_TOKENS", 1024),
+        "max_tokens": get_secret_int("AGENT1_MAX_TOKENS", 4096),
         "frequency_penalty": None,
         "presence_penalty": None,
         "extra_body": None,
@@ -108,6 +113,10 @@ for no, cfg in AGENT_CONFIG.items():
     st.sidebar.write(f"Ajan {no} ({cfg['name']}): {'key OK' if key_ok else 'key YOK'}")
     st.sidebar.caption(cfg["model"])
 
+st.sidebar.write(
+    f"Vision: {'key OK' if (VISION_API_KEY and VISION_API_KEY.startswith('nvapi-') and len(VISION_API_KEY) > 10) else 'key YOK'}"
+)
+st.sidebar.caption(VISION_MODEL)
 
 # --- SESSION STATE ---
 defaults = {
@@ -122,6 +131,7 @@ defaults = {
     "user_instruction_1": "",
     "user_instruction_2": "",
     "user_instruction_3": "",
+    "image_analyses": [],
 }
 for key, value in defaults.items():
     if key not in st.session_state:
@@ -132,18 +142,28 @@ AGENT_PROMPTS = {
         "Sen 1. Ajan (Veri Çıkarım ve Yapılandırma)sın. Görevin, sana sağlanan ham veri "
         "ve metin yığınlarını okumak, gereksiz tekrarları temizlemek ve veriyi mantıklı "
         "başlıklar altında yapılandırılmış teknik bir özet haline getirmektir. "
-        "Yorum ekleme, sadece veriyi düzenle."
+        "Yorum ekleme, sadece veriyi düzenle. "
+        "Ham veri içinde 'GÖRSEL ANALİZİ' bölümleri varsa bunları da yapılandırmaya dahil et "
+        "(tablolar, grafikler, ekran görüntüleri, belgelerdeki resimler). "
+        "KRİTİK KURALLAR: (1) Yalnızca verilen ham verideki gerçek isimleri, sayıları ve "
+        "değerleri kullan. (2) [Bölüm 1], [ortalama puan], örnek/şablon/yer tutucu metin "
+        "UYDURMA. (3) Ham veri boşsa veya okunamadıysa bunu açıkça yaz; sahte veri üretme."
     ),
     2: (
         "Sen 2. Ajan (Teknik Analiz)sin. Sana hem ham kaynak veri hem de 1. ajanın "
         "yapılandırılmış çıktısı verilir. Eğilimleri, anormallikleri, kritik değerleri "
         "ve teknik çıkarımları belirleyerek detaylı bir analitik rapor taslağı oluştur. "
-        "1. ajan çıktısını temel al, ham veriyle doğrula ve zenginleştir."
+        "1. ajan çıktısını temel al, ham veriyle doğrula ve zenginleştir. "
+        "Görsel analiz metinlerini (grafik, tablo görüntüsü, belge resmi) sayısal/metinsel "
+        "veriyle karşılaştır; çelişki veya ek bulgu varsa belirt. "
+        "Ham veri veya 1. ajan çıktısı boş/şablon ise uydurma analiz yapma; eksikliği belirt."
     ),
     3: (
         "Sen 3. Ajan (Nihai Rapor)sun. Sana ham kaynak veri, 1. ajan çıktısı ve 2. ajan "
         "analizi verilir. Bunları birleştirerek tutarlı, eksiksiz ve sunuma hazır nihai "
-        "teknik raporu yaz. Çelişkileri çöz, tekrarları kaldır, net bölümler halinde sun."
+        "teknik raporu yaz. Çelişkileri çöz, tekrarları kaldır, net bölümler halinde sun. "
+        "Görsel bulguları ayrı bir bölümde veya ilgili başlık altında özetle. "
+        "Yalnızca verilen gerçek veriyi kullan; yer tutucu veya örnek veri üretme."
     ),
 }
 
@@ -161,13 +181,176 @@ def init_nvidia_client(agent_no: int = 1):
 
 
 def parse_excel(file):
-    df = pd.read_excel(file)
-    return df.to_string(index=False)
+    """Tüm sheet'leri okur."""
+    file.seek(0)
+    sheets = pd.read_excel(file, sheet_name=None)
+    parts = []
+    for sheet_name, df in sheets.items():
+        parts.append(f"[Sayfa: {sheet_name}]")
+        if df.empty:
+            parts.append("(boş sayfa)")
+        else:
+            parts.append(df.to_string(index=False))
+    return "\n".join(parts)
 
 
 def parse_docx(file):
+    """Paragraflar + tablolar (çoğu puan/liste Word tablosunda olur)."""
+    file.seek(0)
     doc = Document(io.BytesIO(file.read()))
-    return "\n".join(para.text for para in doc.paragraphs)
+    parts = []
+
+    for para in doc.paragraphs:
+        text = (para.text or "").strip()
+        if text:
+            parts.append(text)
+
+    for t_idx, table in enumerate(doc.tables, start=1):
+        parts.append(f"\n--- Tablo {t_idx} ---")
+        for row in table.rows:
+            cells = []
+            for cell in row.cells:
+                cell_text = " ".join(
+                    (p.text or "").strip() for p in cell.paragraphs
+                ).strip()
+                cells.append(cell_text.replace("\n", " "))
+            if any(cells):
+                parts.append(" | ".join(cells))
+
+    return "\n".join(parts).strip()
+
+
+def _guess_mime(name: str, content_type: str = "") -> str:
+    ct = (content_type or "").lower()
+    if ct.startswith("image/"):
+        return ct
+    lower = (name or "").lower()
+    if lower.endswith(".png"):
+        return "image/png"
+    if lower.endswith(".webp"):
+        return "image/webp"
+    if lower.endswith(".gif"):
+        return "image/gif"
+    return "image/jpeg"
+
+
+def extract_images_from_docx(file):
+    """Word içindeki gömülü görselleri (bytes, mime, label) listesi olarak döner."""
+    file.seek(0)
+    doc = Document(io.BytesIO(file.read()))
+    images = []
+    idx = 0
+    for rel in doc.part.rels.values():
+        if "image" not in (rel.reltype or ""):
+            continue
+        idx += 1
+        try:
+            blob = rel.target_part.blob
+            mime = _guess_mime(
+                getattr(rel.target_part, "partname", "") or "",
+                getattr(rel.target_part, "content_type", "") or "",
+            )
+            images.append(
+                {
+                    "blob": blob,
+                    "mime": mime,
+                    "label": f"{getattr(file, 'name', 'docx')}_gorsel_{idx}",
+                }
+            )
+        except Exception:
+            continue
+    return images
+
+
+def collect_uploaded_image(file):
+    file.seek(0)
+    blob = file.read()
+    mime = _guess_mime(file.name, getattr(file, "type", "") or "")
+    return {"blob": blob, "mime": mime, "label": file.name}
+
+
+def init_vision_client():
+    if not VISION_API_KEY or not VISION_API_KEY.startswith("nvapi-"):
+        return None
+    return OpenAI(base_url=NVIDIA_BASE_URL, api_key=VISION_API_KEY, timeout=300.0)
+
+
+def analyze_image_with_vision(client, image: dict) -> str:
+    """Tek görseli VLM ile açıklar; OCR + içerik özeti."""
+    b64 = base64.b64encode(image["blob"]).decode("utf-8")
+    data_url = f"data:{image['mime']};base64,{b64}"
+    prompt = (
+        "Bu görseli teknik rapor için incele. "
+        "Varsa tüm okunabilir metinleri (OCR), tablo/grafik değerlerini, "
+        "başlıkları ve dikkat çeken bulguları Türkçe, maddeler halinde yaz. "
+        "Uydurma veri ekleme; okuyamadığın yerleri belirt."
+    )
+    completion = client.chat.completions.create(
+        model=VISION_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+        temperature=0.2,
+        max_tokens=1024,
+        stream=False,
+    )
+    content = completion.choices[0].message.content
+    return content if content is not None else ""
+
+
+def analyze_all_images(images: list) -> str:
+    """Görselleri sırayla VLM ile analiz eder; metin bloğu döner."""
+    if not images:
+        return ""
+
+    client = init_vision_client()
+    if client is None:
+        return (
+            "\n=== GÖRSEL ANALİZİ ===\n"
+            f"{len(images)} görsel bulundu ancak VISION_API_KEY / AGENT1_API_KEY yok; "
+            "analiz atlandı.\n"
+        )
+
+    limited = images[:VISION_MAX_IMAGES]
+    parts = [
+        "\n=== GÖRSEL ANALİZİ ===",
+        f"Toplam {len(images)} görsel; analiz edilen: {len(limited)} "
+        f"(model: {VISION_MODEL})",
+    ]
+    for i, img in enumerate(limited, start=1):
+        label = img.get("label", f"gorsel_{i}")
+        try:
+            # Çok büyük görselleri atla (~4MB üstü)
+            if len(img["blob"]) > 4_000_000:
+                parts.append(f"\n--- {label} ---\n(çok büyük, atlandı)")
+                continue
+            desc = analyze_image_with_vision(client, img)
+            parts.append(f"\n--- {label} ---\n{desc}")
+        except Exception as e:
+            parts.append(f"\n--- {label} ---\nGörsel analiz hatası: {e}")
+
+    if len(images) > VISION_MAX_IMAGES:
+        parts.append(
+            f"\n(Not: {len(images) - VISION_MAX_IMAGES} görsel limit nedeniyle atlandı.)"
+        )
+    return "\n".join(parts)
+
+
+def validate_extracted_text(name: str, content: str) -> str:
+    """Boş/çok kısa içerikte uyarı; ajanın uydurma şablon üretmesini engeller."""
+    text = (content or "").strip()
+    if len(text) < 20:
+        return (
+            f"{name}: DOSYA İÇERİĞİ BOŞ VEYA OKUNAMADI. "
+            "Paragraf/tablo bulunamadı. Lütfen dosyayı kontrol edin."
+        )
+    return text
 
 
 def call_agent(client, agent_no: int, user_content: str, max_tokens=None):
@@ -287,6 +470,7 @@ def reset_pipeline():
     st.session_state.user_instruction_1 = ""
     st.session_state.user_instruction_2 = ""
     st.session_state.user_instruction_3 = ""
+    st.session_state.image_analyses = []
 
 
 def finalize_with(output_text: str, agent_no: int):
@@ -471,31 +655,77 @@ if st.session_state.current_step == 1:
     left, right = st.columns([1.2, 1])
     with left:
         uploaded_files = st.file_uploader(
-            "Analiz edilecek Excel (.xlsx) veya Word (.docx) dosyalarını seçin",
-            type=["xlsx", "docx"],
+            "Excel / Word / görsel dosyaları seçin",
+            type=["xlsx", "docx", "png", "jpg", "jpeg", "webp"],
             accept_multiple_files=True,
+            help="Word içindeki gömülü resimler de otomatik incelenir.",
         )
     with right:
         render_chat_panel(
             1,
-            "Örn: Tekrarları sil, tarihleri ISO formatına çevir, tabloyu başlıklara ayır...",
+            "Örn: Tekrarları sil, tabloları düzenle, görsellerdeki puanları da dahil et...",
         )
 
     if uploaded_files and st.button("Dosyaları İşle ve 1. Ajanı Çalıştır"):
         client = init_nvidia_client(1)
         if client:
-            with st.spinner("Dosyalar okunuyor, 1. ajan yapılandırıyor..."):
+            with st.spinner(
+                "Dosyalar ve görseller okunuyor, vision + 1. ajan çalışıyor..."
+            ):
                 combined = []
+                all_images = []
                 for file in uploaded_files:
-                    if file.name.endswith(".xlsx"):
-                        content = parse_excel(file)
+                    name = file.name.lower()
+                    if name.endswith(".xlsx"):
+                        content = validate_extracted_text(
+                            file.name, parse_excel(file)
+                        )
                         combined.append(f"\n--- {file.name} (Excel) ---\n{content}")
-                    elif file.name.endswith(".docx"):
-                        content = parse_docx(file)
+                    elif name.endswith(".docx"):
+                        content = validate_extracted_text(
+                            file.name, parse_docx(file)
+                        )
                         combined.append(f"\n--- {file.name} (Word) ---\n{content}")
+                        all_images.extend(extract_images_from_docx(file))
+                    elif name.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                        all_images.append(collect_uploaded_image(file))
+                        combined.append(
+                            f"\n--- {file.name} (Görsel dosya) ---\n"
+                            "(içerik vision modeliyle aşağıda analiz edilecek)"
+                        )
 
-                raw_data = "\n".join(combined)
+                vision_text = ""
+                if all_images:
+                    with st.status(
+                        f"{len(all_images)} görsel inceleniyor...", expanded=True
+                    ) as status:
+                        vision_text = analyze_all_images(all_images)
+                        st.session_state.image_analyses = [
+                            {"label": img["label"], "mime": img["mime"]}
+                            for img in all_images
+                        ]
+                        status.update(
+                            label=f"{min(len(all_images), VISION_MAX_IMAGES)} görsel analiz edildi",
+                            state="complete",
+                        )
+                    if vision_text:
+                        combined.append(vision_text)
+
+                raw_data = "\n".join(combined).strip()
                 st.session_state.raw_data = raw_data
+
+                only_empty_docs = (
+                    "DOSYA İÇERİĞİ BOŞ" in raw_data
+                    and "=== GÖRSEL ANALİZİ ===" not in raw_data
+                )
+                if only_empty_docs or len(raw_data) < 40:
+                    st.error(
+                        "Dosya/görsel içeriği okunamadı veya boş. "
+                        "Word tabloları ve gömülü resimler desteklenir; "
+                        "ayrıca png/jpg yükleyebilirsiniz."
+                    )
+                    st.code(raw_data[:2000] if raw_data else "(boş)")
+                    st.stop()
 
                 instr = (st.session_state.user_instruction_1 or "").strip()
                 if instr:
@@ -508,7 +738,11 @@ if st.session_state.current_step == 1:
                         f"Yapılandırılacak Ham Veri:\n{raw_data}",
                     )
                     st.session_state.agent1_output = output
-                    append_chat("assistant", output[:1500] + ("..." if len(output) > 1500 else ""), agent=1)
+                    append_chat(
+                        "assistant",
+                        output[:1500] + ("..." if len(output) > 1500 else ""),
+                        agent=1,
+                    )
                     st.session_state.current_step = 2
                     st.rerun()
                 except Exception as e:
