@@ -20,13 +20,24 @@ st.set_page_config(
 
 st.title("Çoklu Ajan Raporlama Sistemi (Adım Adım Onaylı)")
 
-# --- YAN MENÜ: API AYARLARI ---
-st.sidebar.header("Kimlik Doğrulama & Model Ayarları")
-nv_api_key = st.sidebar.text_input(
-    "NVIDIA API Key",
-    type="password",
-    help="nvapi- ile başlayan anahtarınızı girin.",
-)
+# --- SECRETS / API ANAHTARLARI ---
+def get_secret(name: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(name, default)
+        return str(value).strip() if value is not None else default
+    except Exception:
+        return default
+
+
+# Streamlit Secrets: AGENT1_API_KEY, AGENT2_API_KEY, AGENT3_API_KEY
+AGENT_API_KEYS = {
+    1: get_secret("AGENT1_API_KEY"),
+    2: get_secret("AGENT2_API_KEY"),
+    3: get_secret("AGENT3_API_KEY"),
+}
+
+# --- YAN MENÜ: MODEL AYARLARI ---
+st.sidebar.header("Model Ayarları")
 selected_model = st.sidebar.selectbox(
     "Kullanılacak Model",
     [
@@ -35,6 +46,11 @@ selected_model = st.sidebar.selectbox(
         "mistralai/mixtral-8x22b-instruct-v0.1",
     ],
 )
+
+st.sidebar.caption("API anahtarları Streamlit Secrets üzerinden okunur.")
+for no in (1, 2, 3):
+    ok = bool(AGENT_API_KEYS[no])
+    st.sidebar.write(f"{'✅' if ok else '❌'} Ajan {no} API key")
 
 # --- SESSION STATE ---
 defaults = {
@@ -71,13 +87,17 @@ AGENT_PROMPTS = {
 }
 
 
-def init_nvidia_client():
-    if not nv_api_key:
-        st.error("Lütfen sol menüden geçerli bir NVIDIA API anahtarı girin.")
+def init_nvidia_client(agent_no: int = 1):
+    api_key = AGENT_API_KEYS.get(agent_no) or ""
+    if not api_key:
+        st.error(
+            f"Ajan {agent_no} için API anahtarı bulunamadı. "
+            f"Streamlit Secrets içine AGENT{agent_no}_API_KEY ekleyin."
+        )
         return None
     return OpenAI(
         base_url="https://integrate.api.nvidia.com/v1",
-        api_key=nv_api_key,
+        api_key=api_key,
     )
 
 
@@ -323,9 +343,7 @@ if st.session_state.current_step == 1:
     )
 
     if uploaded_files and st.button("Dosyaları İşle ve 1. Ajanı Çalıştır"):
-        client = init_nvidia_client()
-        if client:
-            with st.spinner("Dosyalar okunuyor, 1. ajan yapılandırıyor..."):
+        client = init_nvidia_client(1)
                 combined = []
                 for file in uploaded_files:
                     if file.name.endswith(".xlsx"):
@@ -380,7 +398,7 @@ elif st.session_state.current_step == 2:
     with c3:
         if st.button("Onayla → 2. Ajana gönder"):
             st.session_state.agent1_output = edited_a1
-            client = init_nvidia_client()
+            client = init_nvidia_client(2)
             if client:
                 with st.spinner("2. ajan analiz ediyor (ham veri + 1. ajan çıktısı)..."):
                     try:
@@ -429,7 +447,7 @@ elif st.session_state.current_step == 3:
     with c3:
         if st.button("Onayla → 3. Ajana gönder"):
             st.session_state.agent2_output = edited_a2
-            client = init_nvidia_client()
+            client = init_nvidia_client(3)
             if client:
                 with st.spinner(
                     "3. ajan nihai raporu yazıyor (ham + 1. ajan + 2. ajan)..."
