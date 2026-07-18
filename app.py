@@ -8,6 +8,7 @@ import base64
 import requests
 from datetime import datetime
 from openai import OpenAI
+import google.generativeai as genai  # Google Gemini Entegrasyonu
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
@@ -66,10 +67,10 @@ VISION_TOP_P = get_secret_float("VISION_TOP_P", 1.0)
 VISION_MAX_TOKENS = get_secret_int("VISION_MAX_TOKENS", 512)
 
 # Her ajan: kendi API key + model + parametreler (Secrets)
-# 1: Llama 3.1 70B | 2: DeepSeek V4 Pro | 3: Mistral Large
+# 1: Llama 3.1 70B (NVIDIA) | 2: DeepSeek V4 Pro (NVIDIA) | 3: Gemini (Google)
 AGENT_CONFIG = {
     1: {
-        "name": "Llama 3.1 70B",
+        "name": "Llama 3.1 70B (NVIDIA)",
         "api_key": get_secret("AGENT1_API_KEY"),
         "model": get_secret("AGENT1_MODEL", "meta/llama-3.1-70b-instruct"),
         "temperature": get_secret_float("AGENT1_TEMPERATURE", 0.2),
@@ -80,7 +81,7 @@ AGENT_CONFIG = {
         "extra_body": None,
     },
     2: {
-        "name": "DeepSeek V4 Pro",
+        "name": "DeepSeek V4 Pro (NVIDIA)",
         "api_key": get_secret("AGENT2_API_KEY"),
         "model": get_secret("AGENT2_MODEL", "deepseek-ai/deepseek-v4-pro"),
         "temperature": get_secret_float("AGENT2_TEMPERATURE", 1.0),
@@ -91,16 +92,14 @@ AGENT_CONFIG = {
         "extra_body": {"chat_template_kwargs": {"thinking": False}},
     },
     3: {
-        "name": "Mistral Large",
-        "api_key": get_secret("AGENT3_API_KEY"),
-        "model": get_secret(
-            "AGENT3_MODEL", "mistralai/mistral-large-3-675b-instruct-2512"
-        ),
-        "temperature": get_secret_float("AGENT3_TEMPERATURE", 0.15),
+        "name": "Gemini Raporlama Üstadı (Google)",
+        "api_key": get_secret("GEMINI_API_KEY"),
+        "model": get_secret("AGENT3_MODEL", "gemini-1.5-pro-latest"),
+        "temperature": get_secret_float("AGENT3_TEMPERATURE", 0.2),
         "top_p": get_secret_float("AGENT3_TOP_P", 1.0),
-        "max_tokens": get_secret_int("AGENT3_MAX_TOKENS", 2048),
-        "frequency_penalty": get_secret_float("AGENT3_FREQUENCY_PENALTY", 0.0),
-        "presence_penalty": get_secret_float("AGENT3_PRESENCE_PENALTY", 0.0),
+        "max_tokens": get_secret_int("AGENT3_MAX_TOKENS", 8192),
+        "frequency_penalty": None,
+        "presence_penalty": None,
         "extra_body": None,
     },
 }
@@ -109,11 +108,12 @@ AGENT_CONFIG = {
 st.sidebar.header("Ajan / API Durumu")
 st.sidebar.caption("Anahtarlar Streamlit Secrets'tan okunur.")
 for no, cfg in AGENT_CONFIG.items():
-    key_ok = (
-        bool(cfg["api_key"])
-        and cfg["api_key"].startswith("nvapi-")
-        and len(cfg["api_key"]) > 10
-    )
+    if no in [1, 2]:
+        key_ok = bool(cfg["api_key"]) and cfg["api_key"].startswith("nvapi-") and len(cfg["api_key"]) > 10
+    else:
+        # Gemini API Key kontrolü
+        key_ok = bool(cfg["api_key"]) and len(cfg["api_key"]) > 15
+
     st.sidebar.write(f"Ajan {no} ({cfg['name']}): {'key OK' if key_ok else 'key YOK'}")
     st.sidebar.caption(cfg["model"])
 
@@ -163,11 +163,14 @@ AGENT_PROMPTS = {
         "Ham veri veya 1. ajan çıktısı boş/şablon ise uydurma analiz yapma; eksikliği belirt."
     ),
     3: (
-        "Sen 3. Ajan (Nihai Rapor)sun. Sana ham kaynak veri, 1. ajan çıktısı ve 2. ajan "
-        "analizi verilir. Bunları birleştirerek tutarlı, eksiksiz ve sunuma hazır nihai "
-        "teknik raporu yaz. Çelişkileri çöz, tekrarları kaldır, net bölümler halinde sun. "
-        "Görsel bulguları ayrı bir bölümde veya ilgili başlık altında özetle. "
-        "Yalnızca verilen gerçek veriyi kullan; yer tutucu veya örnek veri üretme."
+        "Sen 3. Ajan (Nihai Rapor, Kurumsal Biçimlendirme ve Görselleştirme Üstadı)sın. "
+        "Sana ham kaynak veri, 1. ajan çıktısı ve 2. ajan analizi verilir. "
+        "Bunları birleştirerek tutarlı, eksiksiz, üst düzey yöneticilere sunuma hazır nihai teknik raporu yaz.\n"
+        "KESİNLİKLE ŞU 4 KURALLA HAREKET ET:\n"
+        "1. YÖNETİCİ ÖZETİ: Raporun en tepesine yöneticilerin tek bakışta konuyu, riskleri ve sonuçları anlayacağı net bir 'Yönetici Özeti' (Executive Summary) yaz.\n"
+        "2. NİZAMİ TABLOLAR: Metin içindeki tüm veri karşılaştırmalarını, anomali listlerini ve sayısal dağılımları KESİNLİKLE nizami 'Markdown Tabloları' haline getir.\n"
+        "3. MERMAID ŞEMALARI: Süreç akışlarını, veri ilişkilerini veya dağılımları görselleştirmek için mutlaka en az bir adet geçerli 'mermaid' kod bloğu (örneğin flowchart TD, sequenceDiagram veya pie chart) oluştur.\n"
+        "4. KURUMSAL DİL: Dili aşırı övgüden arındırılmış, doğrudan, teknik odaklı ve kusursuz bir kurumsal Türkçe ile yaz. Asla yer tutucu veya örnek veri üretme."
     ),
 }
 
@@ -182,6 +185,19 @@ def init_nvidia_client(agent_no: int = 1):
         )
         return None
     return OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key, timeout=300.0)
+
+
+def init_gemini_client():
+    cfg = AGENT_CONFIG[3]
+    api_key = cfg["api_key"]
+    if not api_key or len(api_key) < 15:
+        st.error(
+            "3. Ajan (Gemini) için geçerli API anahtarı yok. "
+            "Secrets'a GEMINI_API_KEY = \"AIzaSy...\" ekleyin."
+        )
+        return None
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel(cfg["model"])
 
 
 def parse_excel(file):
@@ -281,7 +297,7 @@ def init_vision_client():
 
 
 def analyze_image_with_vision(_client, image: dict) -> str:
-    """NVIDIA vision: requests + chat/completions (senin örnek payload ile uyumlu)."""
+    """NVIDIA vision: requests + chat/completions."""
     b64 = base64.b64encode(image["blob"]).decode("utf-8")
     data_url = f"data:{image['mime']};base64,{b64}"
     prompt = (
@@ -354,7 +370,6 @@ def analyze_all_images(images: list) -> str:
     for i, img in enumerate(limited, start=1):
         label = img.get("label", f"gorsel_{i}")
         try:
-            # Çok büyük görselleri atla (~4MB üstü)
             if len(img["blob"]) > 4_000_000:
                 parts.append(f"\n--- {label} ---\n(çok büyük, atlandı)")
                 continue
@@ -391,27 +406,43 @@ def call_agent(client, agent_no: int, user_content: str, max_tokens=None):
             f"{user_content}"
         )
 
-    kwargs = {
-        "model": cfg["model"],
-        "messages": [
-            {"role": "system", "content": AGENT_PROMPTS[agent_no]},
-            {"role": "user", "content": user_content},
-        ],
-        "temperature": cfg["temperature"],
-        "top_p": cfg["top_p"],
-        "max_tokens": cfg["max_tokens"] if max_tokens is None else max_tokens,
-        "stream": False,
-    }
-    if cfg.get("frequency_penalty") is not None:
-        kwargs["frequency_penalty"] = cfg["frequency_penalty"]
-    if cfg.get("presence_penalty") is not None:
-        kwargs["presence_penalty"] = cfg["presence_penalty"]
-    if cfg.get("extra_body"):
-        kwargs["extra_body"] = cfg["extra_body"]
+    # 1. ve 2. Ajan NVIDIA (OpenAI Client) Kullanır
+    if agent_no in [1, 2]:
+        kwargs = {
+            "model": cfg["model"],
+            "messages": [
+                {"role": "system", "content": AGENT_PROMPTS[agent_no]},
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": cfg["temperature"],
+            "top_p": cfg["top_p"],
+            "max_tokens": cfg["max_tokens"] if max_tokens is None else max_tokens,
+            "stream": False,
+        }
+        if cfg.get("frequency_penalty") is not None:
+            kwargs["frequency_penalty"] = cfg["frequency_penalty"]
+        if cfg.get("presence_penalty") is not None:
+            kwargs["presence_penalty"] = cfg["presence_penalty"]
+        if cfg.get("extra_body"):
+            kwargs["extra_body"] = cfg["extra_body"]
 
-    completion = client.chat.completions.create(**kwargs)
-    content = completion.choices[0].message.content
-    return content if content is not None else ""
+        completion = client.chat.completions.create(**kwargs)
+        content = completion.choices[0].message.content
+        return content if content is not None else ""
+
+    # 3. Ajan Google Gemini Kullanır
+    elif agent_no == 3:
+        prompt_with_system = f"{AGENT_PROMPTS[3]}\n\n{user_content}"
+        generation_config = genai.types.GenerationConfig(
+            temperature=cfg["temperature"],
+            top_p=cfg["top_p"],
+            max_output_tokens=cfg["max_tokens"] if max_tokens is None else max_tokens,
+        )
+        response = client.generate_content(
+            prompt_with_system,
+            generation_config=generation_config
+        )
+        return response.text if response.text else ""
 
 
 def append_chat(role: str, content: str, agent=None):
@@ -482,7 +513,8 @@ def build_agent3_prompt(raw_data: str, agent1_output: str, agent2_output: str) -
         f"{agent1_output}\n\n"
         "=== 2. AJAN ÇIKTISI ===\n"
         f"{agent2_output}\n\n"
-        "Ham veri + 1. ajan + 2. ajan çıktılarını birleştirerek nihai raporu oluştur."
+        "Ham veri + 1. ajan + 2. ajan çıktılarını birleştirerek Yönetici Özeti, "
+        "Markdown tabloları ve Mermaid şeması içeren kusursuz nihai raporu oluştur."
     )
 
 
@@ -553,7 +585,6 @@ def build_docx_bytes(report_text: str, agent_no: int) -> bytes:
 
 
 def _register_pdf_font() -> str:
-    """Türkçe karakter destekli sistem fontu bulmaya çalışır; yoksa Helvetica."""
     candidates = [
         (r"C:\Windows\Fonts\arial.ttf", "ArialTR"),
         (r"C:\Windows\Fonts\calibri.ttf", "CalibriTR"),
@@ -843,7 +874,7 @@ elif st.session_state.current_step == 2:
 elif st.session_state.current_step == 3:
     st.header("Adım 3: 2. Ajan Çıktısı")
     st.info(
-        "2. ajan çıktısını kontrol et. 3. ajana gitmeden önce nihai rapor talimatını yaz."
+        "2. ajan çıktısını kontrol et. 3. ajana (Gemini) gitmeden önce nihai rapor talimatını yaz."
     )
 
     left, right = st.columns([1.2, 1])
@@ -863,7 +894,7 @@ elif st.session_state.current_step == 3:
     with right:
         render_chat_panel(
             3,
-            "Örn: Yönetici özeti yaz, riskleri maddele, net başlıklar kullan... (Mistral)",
+            "Örn: Yönetici özeti yaz, riskleri maddele, net tablolar kullan... (Gemini)",
         )
 
     c1, c2, c3 = st.columns(3)
@@ -876,12 +907,12 @@ elif st.session_state.current_step == 3:
             st.session_state.agent2_output = edited_a2
             finalize_with(edited_a2, 2)
     with c3:
-        if st.button("Onayla → 3. Ajana gönder"):
+        if st.button("Onayla → 3. Ajana (Gemini) gönder"):
             st.session_state.agent2_output = edited_a2
-            client = init_nvidia_client(3)
+            client = init_gemini_client()
             if client:
                 with st.spinner(
-                    "3. ajan nihai raporu yazıyor (ham + 1. ajan + 2. ajan)..."
+                    "3. Ajan (Gemini) tablo ve şemalarla nihai raporu yazıyor..."
                 ):
                     instr = (st.session_state.user_instruction_3 or "").strip()
                     if instr:
@@ -902,11 +933,11 @@ elif st.session_state.current_step == 3:
                         st.session_state.current_step = 4
                         st.rerun()
                     except Exception as e:
-                        st.error(f"API çağrısı sırasında hata: {e}")
+                        st.error(f"Gemini API çağrısı sırasında hata: {e}")
 
 # --- ADIM 4: 3. AJAN ÇIKTISI ---
 elif st.session_state.current_step == 4:
-    st.header("Adım 4: 3. Ajan Çıktısı")
+    st.header("Adım 4: 3. Ajan (Gemini) Çıktısı")
     st.warning(
         "3. ajan ham veri + 1. ajan + 2. ajan çıktılarını birleştirdi. "
         "Düzenleyip sonuçlandırın."
@@ -948,11 +979,14 @@ elif st.session_state.current_step == 5:
     base_name = f"rapor_ajan{finished}_{stamp}"
 
     st.text_area(
-        "Nihai rapor",
+        "Nihai rapor (Düzenleme Ekranı)",
         value=report_text,
-        height=450,
+        height=300,
         key="final_view",
     )
+    
+    st.subheader("Görsel Rapor Önizlemesi (Tablo ve Şema Desteği ile)")
+    st.markdown(report_text, unsafe_allow_html=True)
 
     st.subheader("İndir")
     d1, d2, d3 = st.columns(3)
