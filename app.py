@@ -344,6 +344,8 @@ if st.session_state.current_step == 1:
 
     if uploaded_files and st.button("Dosyaları İşle ve 1. Ajanı Çalıştır"):
         client = init_nvidia_client(1)
+        if client:
+            with st.spinner("Dosyalar okunuyor, 1. ajan yapılandırıyor..."):
                 combined = []
                 for file in uploaded_files:
                     if file.name.endswith(".xlsx"):
