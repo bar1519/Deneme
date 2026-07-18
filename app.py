@@ -57,7 +57,7 @@ def get_secret_int(name: str, default: int) -> int:
 
 
 # Her ajan: kendi API key + model + parametreler (Secrets)
-# 1: Llama 3.1 70B | 2: Mistral Large | 3: DeepSeek V4 Pro
+# 1: Llama 3.1 70B | 2: DeepSeek V4 Pro | 3: Mistral Large
 AGENT_CONFIG = {
     1: {
         "name": "Llama 3.1 70B",
@@ -71,28 +71,28 @@ AGENT_CONFIG = {
         "extra_body": None,
     },
     2: {
-        "name": "Mistral Large",
-        "api_key": get_secret("AGENT2_API_KEY"),
-        "model": get_secret(
-            "AGENT2_MODEL", "mistralai/mistral-large-3-675b-instruct-2512"
-        ),
-        "temperature": get_secret_float("AGENT2_TEMPERATURE", 0.15),
-        "top_p": get_secret_float("AGENT2_TOP_P", 1.0),
-        "max_tokens": get_secret_int("AGENT2_MAX_TOKENS", 2048),
-        "frequency_penalty": get_secret_float("AGENT2_FREQUENCY_PENALTY", 0.0),
-        "presence_penalty": get_secret_float("AGENT2_PRESENCE_PENALTY", 0.0),
-        "extra_body": None,
-    },
-    3: {
         "name": "DeepSeek V4 Pro",
-        "api_key": get_secret("AGENT3_API_KEY"),
-        "model": get_secret("AGENT3_MODEL", "deepseek-ai/deepseek-v4-pro"),
-        "temperature": get_secret_float("AGENT3_TEMPERATURE", 1.0),
-        "top_p": get_secret_float("AGENT3_TOP_P", 0.95),
-        "max_tokens": get_secret_int("AGENT3_MAX_TOKENS", 16384),
+        "api_key": get_secret("AGENT2_API_KEY"),
+        "model": get_secret("AGENT2_MODEL", "deepseek-ai/deepseek-v4-pro"),
+        "temperature": get_secret_float("AGENT2_TEMPERATURE", 1.0),
+        "top_p": get_secret_float("AGENT2_TOP_P", 0.95),
+        "max_tokens": get_secret_int("AGENT2_MAX_TOKENS", 16384),
         "frequency_penalty": None,
         "presence_penalty": None,
         "extra_body": {"chat_template_kwargs": {"thinking": False}},
+    },
+    3: {
+        "name": "Mistral Large",
+        "api_key": get_secret("AGENT3_API_KEY"),
+        "model": get_secret(
+            "AGENT3_MODEL", "mistralai/mistral-large-3-675b-instruct-2512"
+        ),
+        "temperature": get_secret_float("AGENT3_TEMPERATURE", 0.15),
+        "top_p": get_secret_float("AGENT3_TOP_P", 1.0),
+        "max_tokens": get_secret_int("AGENT3_MAX_TOKENS", 2048),
+        "frequency_penalty": get_secret_float("AGENT3_FREQUENCY_PENALTY", 0.0),
+        "presence_penalty": get_secret_float("AGENT3_PRESENCE_PENALTY", 0.0),
+        "extra_body": None,
     },
 }
 
@@ -118,6 +118,10 @@ defaults = {
     "agent3_output": None,
     "final_report": None,
     "finalized_at": None,  # 1 | 2 | 3
+    "chat_log": [],  # [{role, content, agent, step}]
+    "user_instruction_1": "",
+    "user_instruction_2": "",
+    "user_instruction_3": "",
 }
 for key, value in defaults.items():
     if key not in st.session_state:
@@ -153,7 +157,7 @@ def init_nvidia_client(agent_no: int = 1):
             f"Secrets'a AGENT{agent_no}_API_KEY = \"nvapi-...\" ekleyin."
         )
         return None
-    return OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key)
+    return OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key, timeout=300.0)
 
 
 def parse_excel(file):
@@ -168,6 +172,14 @@ def parse_docx(file):
 
 def call_agent(client, agent_no: int, user_content: str, max_tokens=None):
     cfg = AGENT_CONFIG[agent_no]
+    instruction = (st.session_state.get(f"user_instruction_{agent_no}") or "").strip()
+    if instruction:
+        user_content = (
+            f"=== KULLANICI TALİMATI (bu adımda yapılacaklar) ===\n"
+            f"{instruction}\n\n"
+            f"{user_content}"
+        )
+
     kwargs = {
         "model": cfg["model"],
         "messages": [
@@ -189,6 +201,56 @@ def call_agent(client, agent_no: int, user_content: str, max_tokens=None):
     completion = client.chat.completions.create(**kwargs)
     content = completion.choices[0].message.content
     return content if content is not None else ""
+
+
+def append_chat(role: str, content: str, agent=None):
+    st.session_state.chat_log.append(
+        {
+            "role": role,
+            "content": content,
+            "agent": agent,
+            "step": st.session_state.current_step,
+        }
+    )
+
+
+def render_chat_panel(agent_no: int, placeholder: str):
+    """Her adımda kullanıcının talimat yazdığı chat alanı."""
+    st.subheader("Chat / Talimat")
+    st.caption(
+        f"Ajan {agent_no} için bu adımda ne yapılsın? Yazıların ajan çağrısına eklenir."
+    )
+
+    relevant = [
+        m
+        for m in st.session_state.chat_log
+        if m.get("agent") in (None, agent_no)
+    ]
+    if relevant:
+        with st.container(height=220):
+            for m in relevant[-30:]:
+                who = {
+                    "user": "Sen",
+                    "assistant": f"Ajan {m.get('agent') or '?'}",
+                    "system": "Sistem",
+                }.get(m["role"], m["role"])
+                st.markdown(f"**{who}:** {m['content']}")
+    else:
+        st.caption("Henüz mesaj yok. Aşağıya bu adım için talimatını yaz.")
+
+    note_key = f"user_instruction_{agent_no}"
+    st.text_area(
+        "Bu adımda yapılacaklar (sen yaz)",
+        height=120,
+        key=note_key,
+        placeholder=placeholder,
+    )
+
+    if st.button("Talimatı sohbete kaydet", key=f"save_chat_{agent_no}"):
+        text = (st.session_state.get(note_key) or "").strip()
+        if text:
+            append_chat("user", text, agent=agent_no)
+            st.rerun()
 
 
 def build_agent2_prompt(raw_data: str, agent1_output: str) -> str:
@@ -221,6 +283,10 @@ def reset_pipeline():
     st.session_state.agent3_output = None
     st.session_state.final_report = None
     st.session_state.finalized_at = None
+    st.session_state.chat_log = []
+    st.session_state.user_instruction_1 = ""
+    st.session_state.user_instruction_2 = ""
+    st.session_state.user_instruction_3 = ""
 
 
 def finalize_with(output_text: str, agent_no: int):
@@ -395,19 +461,25 @@ def show_progress():
 
 show_progress()
 
-# --- ADIM 1: DOSYA YÜKLEME ---
+# --- ADIM 1: DOSYA YÜKLEME + CHAT ---
 if st.session_state.current_step == 1:
     st.header("Adım 1: Kaynak Dosyaların Yüklenmesi")
     st.caption(
-        "Ham veri önce 1. ajana gider; aynı ham veri daha sonra 2. ve 3. ajana da "
-        "bağlam olarak iletilir. Her ajan sonrası erken sonuçlandırma yapılabilir."
+        "Ham veri önce 1. ajana gider. Solda dosya yükle, sağda bu adımda ne yapılacağını yaz."
     )
 
-    uploaded_files = st.file_uploader(
-        "Analiz edilecek Excel (.xlsx) veya Word (.docx) dosyalarını seçin",
-        type=["xlsx", "docx"],
-        accept_multiple_files=True,
-    )
+    left, right = st.columns([1.2, 1])
+    with left:
+        uploaded_files = st.file_uploader(
+            "Analiz edilecek Excel (.xlsx) veya Word (.docx) dosyalarını seçin",
+            type=["xlsx", "docx"],
+            accept_multiple_files=True,
+        )
+    with right:
+        render_chat_panel(
+            1,
+            "Örn: Tekrarları sil, tarihleri ISO formatına çevir, tabloyu başlıklara ayır...",
+        )
 
     if uploaded_files and st.button("Dosyaları İşle ve 1. Ajanı Çalıştır"):
         client = init_nvidia_client(1)
@@ -425,34 +497,50 @@ if st.session_state.current_step == 1:
                 raw_data = "\n".join(combined)
                 st.session_state.raw_data = raw_data
 
+                instr = (st.session_state.user_instruction_1 or "").strip()
+                if instr:
+                    append_chat("user", instr, agent=1)
+
                 try:
-                    st.session_state.agent1_output = call_agent(
+                    output = call_agent(
                         client,
                         1,
                         f"Yapılandırılacak Ham Veri:\n{raw_data}",
                     )
+                    st.session_state.agent1_output = output
+                    append_chat("assistant", output[:1500] + ("..." if len(output) > 1500 else ""), agent=1)
                     st.session_state.current_step = 2
                     st.rerun()
                 except Exception as e:
                     st.error(f"API çağrısı sırasında hata: {e}")
 
-# --- ADIM 2: 1. AJAN ÇIKTISI ---
+# --- ADIM 2: 1. AJAN ÇIKTISI + CHAT (2. ajan talimatı) ---
 elif st.session_state.current_step == 2:
     st.header("Adım 2: 1. Ajan Çıktısı")
     st.info(
-        "1. ajan ham veriyi yapılandırdı. İyi ise hemen sonuçlandırabilir veya "
-        "2. ajana (ham veri + bu çıktı) gönderebilirsiniz."
+        "1. ajan çıktısını kontrol et. 2. ajana gitmeden önce sağdaki chate "
+        "analiz talimatını yazabilirsin."
     )
 
-    with st.expander("Ham kaynak veri (önizleme)", expanded=False):
-        st.text(st.session_state.raw_data[:4000] + ("..." if len(st.session_state.raw_data or "") > 4000 else ""))
+    left, right = st.columns([1.2, 1])
+    with left:
+        with st.expander("Ham kaynak veri (önizleme)", expanded=False):
+            st.text(
+                st.session_state.raw_data[:4000]
+                + ("..." if len(st.session_state.raw_data or "") > 4000 else "")
+            )
 
-    edited_a1 = st.text_area(
-        "1. Ajan çıktısı (düzenlenebilir)",
-        value=st.session_state.agent1_output or "",
-        height=400,
-        key="edit_agent1",
-    )
+        edited_a1 = st.text_area(
+            "1. Ajan çıktısı (düzenlenebilir)",
+            value=st.session_state.agent1_output or "",
+            height=400,
+            key="edit_agent1",
+        )
+    with right:
+        render_chat_panel(
+            2,
+            "Örn: Anomalilere odaklan, aylık trendleri çıkar, kritik eşikleri işaretle... (DeepSeek)",
+        )
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -469,39 +557,52 @@ elif st.session_state.current_step == 2:
             client = init_nvidia_client(2)
             if client:
                 with st.spinner("2. ajan analiz ediyor (ham veri + 1. ajan çıktısı)..."):
+                    instr = (st.session_state.user_instruction_2 or "").strip()
+                    if instr:
+                        append_chat("user", instr, agent=2)
                     try:
                         prompt = build_agent2_prompt(
                             st.session_state.raw_data,
                             st.session_state.agent1_output,
                         )
-                        st.session_state.agent2_output = call_agent(
-                            client, 2, prompt
+                        output = call_agent(client, 2, prompt)
+                        st.session_state.agent2_output = output
+                        append_chat(
+                            "assistant",
+                            output[:1500] + ("..." if len(output) > 1500 else ""),
+                            agent=2,
                         )
                         st.session_state.current_step = 3
                         st.rerun()
                     except Exception as e:
                         st.error(f"API çağrısı sırasında hata: {e}")
 
-# --- ADIM 3: 2. AJAN ÇIKTISI ---
+# --- ADIM 3: 2. AJAN ÇIKTISI + CHAT (3. ajan talimatı) ---
 elif st.session_state.current_step == 3:
     st.header("Adım 3: 2. Ajan Çıktısı")
     st.info(
-        "2. ajan ham veri + 1. ajan çıktısını analiz etti. "
-        "Erken sonuçlandırabilir veya 3. ajana devam edebilirsiniz."
+        "2. ajan çıktısını kontrol et. 3. ajana gitmeden önce nihai rapor talimatını yaz."
     )
 
-    with st.expander("Girdi özeti", expanded=False):
-        st.markdown("**Ham veri** (kısaltılmış)")
-        st.text((st.session_state.raw_data or "")[:2000])
-        st.markdown("**1. ajan çıktısı**")
-        st.text(st.session_state.agent1_output or "")
+    left, right = st.columns([1.2, 1])
+    with left:
+        with st.expander("Girdi özeti", expanded=False):
+            st.markdown("**Ham veri** (kısaltılmış)")
+            st.text((st.session_state.raw_data or "")[:2000])
+            st.markdown("**1. ajan çıktısı**")
+            st.text(st.session_state.agent1_output or "")
 
-    edited_a2 = st.text_area(
-        "2. Ajan çıktısı (düzenlenebilir)",
-        value=st.session_state.agent2_output or "",
-        height=400,
-        key="edit_agent2",
-    )
+        edited_a2 = st.text_area(
+            "2. Ajan çıktısı (düzenlenebilir)",
+            value=st.session_state.agent2_output or "",
+            height=400,
+            key="edit_agent2",
+        )
+    with right:
+        render_chat_panel(
+            3,
+            "Örn: Yönetici özeti yaz, riskleri maddele, net başlıklar kullan... (Mistral)",
+        )
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -520,14 +621,21 @@ elif st.session_state.current_step == 3:
                 with st.spinner(
                     "3. ajan nihai raporu yazıyor (ham + 1. ajan + 2. ajan)..."
                 ):
+                    instr = (st.session_state.user_instruction_3 or "").strip()
+                    if instr:
+                        append_chat("user", instr, agent=3)
                     try:
                         prompt = build_agent3_prompt(
                             st.session_state.raw_data,
                             st.session_state.agent1_output,
                             st.session_state.agent2_output,
                         )
-                        st.session_state.agent3_output = call_agent(
-                            client, 3, prompt
+                        output = call_agent(client, 3, prompt)
+                        st.session_state.agent3_output = output
+                        append_chat(
+                            "assistant",
+                            output[:1500] + ("..." if len(output) > 1500 else ""),
+                            agent=3,
                         )
                         st.session_state.current_step = 4
                         st.rerun()
