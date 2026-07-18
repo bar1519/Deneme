@@ -20,37 +20,94 @@ st.set_page_config(
 
 st.title("Çoklu Ajan Raporlama Sistemi (Adım Adım Onaylı)")
 
-# --- SECRETS / API ANAHTARLARI ---
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+
+
 def get_secret(name: str, default: str = "") -> str:
     try:
         value = st.secrets.get(name, default)
-        return str(value).strip() if value is not None else default
+        if value is None:
+            return default
+        text = str(value).strip().strip('"').strip("'")
+        if text.startswith("$") or text in ("", "None"):
+            return default
+        return text
     except Exception:
         return default
 
 
-# Streamlit Secrets: AGENT1_API_KEY, AGENT2_API_KEY, AGENT3_API_KEY
-AGENT_API_KEYS = {
-    1: get_secret("AGENT1_API_KEY"),
-    2: get_secret("AGENT2_API_KEY"),
-    3: get_secret("AGENT3_API_KEY"),
+def get_secret_float(name: str, default: float) -> float:
+    raw = get_secret(name, "")
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def get_secret_int(name: str, default: int) -> int:
+    raw = get_secret(name, "")
+    if not raw:
+        return default
+    try:
+        return int(float(raw))
+    except ValueError:
+        return default
+
+
+# Her ajan: kendi API key + model + parametreler (Secrets)
+# 1: Llama 3.1 70B | 2: Mistral Large | 3: DeepSeek V4 Pro
+AGENT_CONFIG = {
+    1: {
+        "name": "Llama 3.1 70B",
+        "api_key": get_secret("AGENT1_API_KEY"),
+        "model": get_secret("AGENT1_MODEL", "meta/llama-3.1-70b-instruct"),
+        "temperature": get_secret_float("AGENT1_TEMPERATURE", 0.2),
+        "top_p": get_secret_float("AGENT1_TOP_P", 0.7),
+        "max_tokens": get_secret_int("AGENT1_MAX_TOKENS", 1024),
+        "frequency_penalty": None,
+        "presence_penalty": None,
+        "extra_body": None,
+    },
+    2: {
+        "name": "Mistral Large",
+        "api_key": get_secret("AGENT2_API_KEY"),
+        "model": get_secret(
+            "AGENT2_MODEL", "mistralai/mistral-large-3-675b-instruct-2512"
+        ),
+        "temperature": get_secret_float("AGENT2_TEMPERATURE", 0.15),
+        "top_p": get_secret_float("AGENT2_TOP_P", 1.0),
+        "max_tokens": get_secret_int("AGENT2_MAX_TOKENS", 2048),
+        "frequency_penalty": get_secret_float("AGENT2_FREQUENCY_PENALTY", 0.0),
+        "presence_penalty": get_secret_float("AGENT2_PRESENCE_PENALTY", 0.0),
+        "extra_body": None,
+    },
+    3: {
+        "name": "DeepSeek V4 Pro",
+        "api_key": get_secret("AGENT3_API_KEY"),
+        "model": get_secret("AGENT3_MODEL", "deepseek-ai/deepseek-v4-pro"),
+        "temperature": get_secret_float("AGENT3_TEMPERATURE", 1.0),
+        "top_p": get_secret_float("AGENT3_TOP_P", 0.95),
+        "max_tokens": get_secret_int("AGENT3_MAX_TOKENS", 16384),
+        "frequency_penalty": None,
+        "presence_penalty": None,
+        "extra_body": {"chat_template_kwargs": {"thinking": False}},
+    },
 }
 
-# --- YAN MENÜ: MODEL AYARLARI ---
-st.sidebar.header("Model Ayarları")
-selected_model = st.sidebar.selectbox(
-    "Kullanılacak Model",
-    [
-        "meta/llama-3.1-405b-instruct",
-        "meta/llama-3.1-70b-instruct",
-        "mistralai/mixtral-8x22b-instruct-v0.1",
-    ],
-)
+# --- YAN MENÜ ---
+st.sidebar.header("Ajan / API Durumu")
+st.sidebar.caption("Anahtarlar Streamlit Secrets'tan okunur.")
+for no, cfg in AGENT_CONFIG.items():
+    key_ok = (
+        bool(cfg["api_key"])
+        and cfg["api_key"].startswith("nvapi-")
+        and len(cfg["api_key"]) > 10
+    )
+    st.sidebar.write(f"Ajan {no} ({cfg['name']}): {'key OK' if key_ok else 'key YOK'}")
+    st.sidebar.caption(cfg["model"])
 
-st.sidebar.caption("API anahtarları Streamlit Secrets üzerinden okunur.")
-for no in (1, 2, 3):
-    ok = bool(AGENT_API_KEYS[no])
-    st.sidebar.write(f"{'✅' if ok else '❌'} Ajan {no} API key")
 
 # --- SESSION STATE ---
 defaults = {
@@ -88,17 +145,15 @@ AGENT_PROMPTS = {
 
 
 def init_nvidia_client(agent_no: int = 1):
-    api_key = AGENT_API_KEYS.get(agent_no) or ""
-    if not api_key:
+    cfg = AGENT_CONFIG[agent_no]
+    api_key = cfg["api_key"]
+    if not api_key or not api_key.startswith("nvapi-"):
         st.error(
-            f"Ajan {agent_no} için API anahtarı bulunamadı. "
-            f"Streamlit Secrets içine AGENT{agent_no}_API_KEY ekleyin."
+            f"Ajan {agent_no} için geçerli API anahtarı yok. "
+            f"Secrets'a AGENT{agent_no}_API_KEY = \"nvapi-...\" ekleyin."
         )
         return None
-    return OpenAI(
-        base_url="https://integrate.api.nvidia.com/v1",
-        api_key=api_key,
-    )
+    return OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key)
 
 
 def parse_excel(file):
@@ -111,17 +166,29 @@ def parse_docx(file):
     return "\n".join(para.text for para in doc.paragraphs)
 
 
-def call_agent(client, agent_no: int, user_content: str, max_tokens: int = 4096):
-    completion = client.chat.completions.create(
-        model=selected_model,
-        messages=[
+def call_agent(client, agent_no: int, user_content: str, max_tokens=None):
+    cfg = AGENT_CONFIG[agent_no]
+    kwargs = {
+        "model": cfg["model"],
+        "messages": [
             {"role": "system", "content": AGENT_PROMPTS[agent_no]},
             {"role": "user", "content": user_content},
         ],
-        temperature=0.2 if agent_no == 1 else 0.3,
-        max_tokens=max_tokens,
-    )
-    return completion.choices[0].message.content
+        "temperature": cfg["temperature"],
+        "top_p": cfg["top_p"],
+        "max_tokens": cfg["max_tokens"] if max_tokens is None else max_tokens,
+        "stream": False,
+    }
+    if cfg.get("frequency_penalty") is not None:
+        kwargs["frequency_penalty"] = cfg["frequency_penalty"]
+    if cfg.get("presence_penalty") is not None:
+        kwargs["presence_penalty"] = cfg["presence_penalty"]
+    if cfg.get("extra_body"):
+        kwargs["extra_body"] = cfg["extra_body"]
+
+    completion = client.chat.completions.create(**kwargs)
+    content = completion.choices[0].message.content
+    return content if content is not None else ""
 
 
 def build_agent2_prompt(raw_data: str, agent1_output: str) -> str:
@@ -363,7 +430,6 @@ if st.session_state.current_step == 1:
                         client,
                         1,
                         f"Yapılandırılacak Ham Veri:\n{raw_data}",
-                        max_tokens=2048,
                     )
                     st.session_state.current_step = 2
                     st.rerun()
@@ -409,7 +475,7 @@ elif st.session_state.current_step == 2:
                             st.session_state.agent1_output,
                         )
                         st.session_state.agent2_output = call_agent(
-                            client, 2, prompt, max_tokens=4096
+                            client, 2, prompt
                         )
                         st.session_state.current_step = 3
                         st.rerun()
@@ -461,7 +527,7 @@ elif st.session_state.current_step == 3:
                             st.session_state.agent2_output,
                         )
                         st.session_state.agent3_output = call_agent(
-                            client, 3, prompt, max_tokens=4096
+                            client, 3, prompt
                         )
                         st.session_state.current_step = 4
                         st.rerun()
