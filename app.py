@@ -5,6 +5,7 @@ from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 import io
 import base64
+import requests
 from datetime import datetime
 from openai import OpenAI
 from reportlab.lib.pagesizes import A4
@@ -60,6 +61,9 @@ def get_secret_int(name: str, default: int) -> int:
 VISION_MODEL = get_secret("VISION_MODEL", "meta/llama-3.2-11b-vision-instruct")
 VISION_API_KEY = get_secret("VISION_API_KEY") or get_secret("AGENT1_API_KEY")
 VISION_MAX_IMAGES = get_secret_int("VISION_MAX_IMAGES", 8)
+VISION_TEMPERATURE = get_secret_float("VISION_TEMPERATURE", 1.0)
+VISION_TOP_P = get_secret_float("VISION_TOP_P", 1.0)
+VISION_MAX_TOKENS = get_secret_int("VISION_MAX_TOKENS", 512)
 
 # Her ajan: kendi API key + model + parametreler (Secrets)
 # 1: Llama 3.1 70B | 2: DeepSeek V4 Pro | 3: Mistral Large
@@ -270,13 +274,14 @@ def collect_uploaded_image(file):
 
 
 def init_vision_client():
+    """Vision için API key kontrolü (çağrı requests ile yapılır)."""
     if not VISION_API_KEY or not VISION_API_KEY.startswith("nvapi-"):
         return None
-    return OpenAI(base_url=NVIDIA_BASE_URL, api_key=VISION_API_KEY, timeout=300.0)
+    return True
 
 
-def analyze_image_with_vision(client, image: dict) -> str:
-    """Tek görseli VLM ile açıklar; OCR + içerik özeti."""
+def analyze_image_with_vision(_client, image: dict) -> str:
+    """NVIDIA vision: requests + chat/completions (senin örnek payload ile uyumlu)."""
     b64 = base64.b64encode(image["blob"]).decode("utf-8")
     data_url = f"data:{image['mime']};base64,{b64}"
     prompt = (
@@ -285,9 +290,16 @@ def analyze_image_with_vision(client, image: dict) -> str:
         "başlıkları ve dikkat çeken bulguları Türkçe, maddeler halinde yaz. "
         "Uydurma veri ekleme; okuyamadığın yerleri belirt."
     )
-    completion = client.chat.completions.create(
-        model=VISION_MODEL,
-        messages=[
+
+    invoke_url = f"{NVIDIA_BASE_URL}/chat/completions"
+    stream = False
+    headers = {
+        "Authorization": f"Bearer {VISION_API_KEY}",
+        "Accept": "text/event-stream" if stream else "application/json",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messages": [
             {
                 "role": "user",
                 "content": [
@@ -296,12 +308,28 @@ def analyze_image_with_vision(client, image: dict) -> str:
                 ],
             }
         ],
-        temperature=0.2,
-        max_tokens=1024,
-        stream=False,
+        "model": VISION_MODEL,
+        "frequency_penalty": 0,
+        "max_tokens": VISION_MAX_TOKENS,
+        "presence_penalty": 0,
+        "stream": stream,
+        "temperature": VISION_TEMPERATURE,
+        "top_p": VISION_TOP_P,
+    }
+
+    response = requests.post(
+        invoke_url, headers=headers, json=payload, stream=stream, timeout=300
     )
-    content = completion.choices[0].message.content
-    return content if content is not None else ""
+    if response.status_code >= 400:
+        raise RuntimeError(f"{response.status_code}: {response.text[:500]}")
+
+    data = response.json()
+    return (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content")
+        or ""
+    )
 
 
 def analyze_all_images(images: list) -> str:
