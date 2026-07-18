@@ -94,7 +94,7 @@ AGENT_CONFIG = {
     3: {
         "name": "Gemini Raporlama Üstadı (Google)",
         "api_key": get_secret("GEMINI_API_KEY"),
-        "model": get_secret("AGENT3_MODEL", "gemini-1.5-pro-latest"),
+        "model": get_secret("AGENT3_MODEL", "gemini-3.5-flash"),
         "temperature": get_secret_float("AGENT3_TEMPERATURE", 0.2),
         "top_p": get_secret_float("AGENT3_TOP_P", 1.0),
         "max_tokens": get_secret_int("AGENT3_MAX_TOKENS", 8192),
