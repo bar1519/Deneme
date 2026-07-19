@@ -1,21 +1,24 @@
+import os
+import io
+import base64
+import requests
+from datetime import datetime
 import streamlit as st
 import pandas as pd
 from docx import Document
 from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-import io
-import base64
-import requests
-from datetime import datetime
 from openai import OpenAI
-import google.generativeai as genai  # Google Gemini Entegrasyonu
+import google.generativeai as genai
 from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle, Image as RLImage
 
+# --- SAYFA YAPILANDIRMASI ---
 st.set_page_config(
     page_title="Onay Mekanizmalı Çoklu Ajan Raporlama Sistemi",
     layout="wide",
@@ -67,7 +70,6 @@ VISION_TOP_P = get_secret_float("VISION_TOP_P", 1.0)
 VISION_MAX_TOKENS = get_secret_int("VISION_MAX_TOKENS", 512)
 
 # Her ajan: kendi API key + model + parametreler (Secrets)
-# 1: Llama 3.1 70B (NVIDIA) | 2: DeepSeek V4 Pro (NVIDIA) | 3: Gemini (Google)
 AGENT_CONFIG = {
     1: {
         "name": "Llama 3.1 70B (NVIDIA)",
@@ -111,7 +113,6 @@ for no, cfg in AGENT_CONFIG.items():
     if no in [1, 2]:
         key_ok = bool(cfg["api_key"]) and cfg["api_key"].startswith("nvapi-") and len(cfg["api_key"]) > 10
     else:
-        # Gemini API Key kontrolü
         key_ok = bool(cfg["api_key"]) and len(cfg["api_key"]) > 15
 
     st.sidebar.write(f"Ajan {no} ({cfg['name']}): {'key OK' if key_ok else 'key YOK'}")
@@ -124,14 +125,14 @@ st.sidebar.caption(VISION_MODEL)
 
 # --- SESSION STATE ---
 defaults = {
-    "current_step": 1,  # 1=upload, 2=ajan1, 3=ajan2, 4=ajan3, 5=final
+    "current_step": 1,
     "raw_data": None,
     "agent1_output": None,
     "agent2_output": None,
     "agent3_output": None,
     "final_report": None,
-    "finalized_at": None,  # 1 | 2 | 3
-    "chat_log": [],  # [{role, content, agent, step}]
+    "finalized_at": None,
+    "chat_log": [],
     "user_instruction_1": "",
     "user_instruction_2": "",
     "user_instruction_3": "",
@@ -201,7 +202,6 @@ def init_gemini_client():
 
 
 def parse_excel(file):
-    """Tüm sheet'leri okur."""
     file.seek(0)
     sheets = pd.read_excel(file, sheet_name=None)
     parts = []
@@ -215,16 +215,13 @@ def parse_excel(file):
 
 
 def parse_docx(file):
-    """Paragraflar + tablolar (çoğu puan/liste Word tablosunda olur)."""
     file.seek(0)
     doc = Document(io.BytesIO(file.read()))
     parts = []
-
     for para in doc.paragraphs:
         text = (para.text or "").strip()
         if text:
             parts.append(text)
-
     for t_idx, table in enumerate(doc.tables, start=1):
         parts.append(f"\n--- Tablo {t_idx} ---")
         for row in table.rows:
@@ -236,7 +233,6 @@ def parse_docx(file):
                 cells.append(cell_text.replace("\n", " "))
             if any(cells):
                 parts.append(" | ".join(cells))
-
     return "\n".join(parts).strip()
 
 
@@ -255,7 +251,6 @@ def _guess_mime(name: str, content_type: str = "") -> str:
 
 
 def extract_images_from_docx(file):
-    """Word içindeki gömülü görselleri (bytes, mime, label) listesi olarak döner."""
     file.seek(0)
     doc = Document(io.BytesIO(file.read()))
     images = []
@@ -290,14 +285,12 @@ def collect_uploaded_image(file):
 
 
 def init_vision_client():
-    """Vision için API key kontrolü (çağrı requests ile yapılır)."""
     if not VISION_API_KEY or not VISION_API_KEY.startswith("nvapi-"):
         return None
     return True
 
 
 def analyze_image_with_vision(_client, image: dict) -> str:
-    """NVIDIA vision: requests + chat/completions."""
     b64 = base64.b64encode(image["blob"]).decode("utf-8")
     data_url = f"data:{image['mime']};base64,{b64}"
     prompt = (
@@ -306,12 +299,10 @@ def analyze_image_with_vision(_client, image: dict) -> str:
         "başlıkları ve dikkat çeken bulguları Türkçe, maddeler halinde yaz. "
         "Uydurma veri ekleme; okuyamadığın yerleri belirt."
     )
-
     invoke_url = f"{NVIDIA_BASE_URL}/chat/completions"
-    stream = False
     headers = {
         "Authorization": f"Bearer {VISION_API_KEY}",
-        "Accept": "text/event-stream" if stream else "application/json",
+        "Accept": "application/json",
         "Content-Type": "application/json",
     }
     payload = {
@@ -325,34 +316,20 @@ def analyze_image_with_vision(_client, image: dict) -> str:
             }
         ],
         "model": VISION_MODEL,
-        "frequency_penalty": 0,
         "max_tokens": VISION_MAX_TOKENS,
-        "presence_penalty": 0,
-        "stream": stream,
         "temperature": VISION_TEMPERATURE,
         "top_p": VISION_TOP_P,
     }
-
-    response = requests.post(
-        invoke_url, headers=headers, json=payload, stream=stream, timeout=300
-    )
+    response = requests.post(invoke_url, headers=headers, json=payload, timeout=300)
     if response.status_code >= 400:
         raise RuntimeError(f"{response.status_code}: {response.text[:500]}")
-
     data = response.json()
-    return (
-        data.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content")
-        or ""
-    )
+    return data.get("choices", [{}])[0].get("message", {}).get("content") or ""
 
 
 def analyze_all_images(images: list) -> str:
-    """Görselleri sırayla VLM ile analiz eder; metin bloğu döner."""
     if not images:
         return ""
-
     client = init_vision_client()
     if client is None:
         return (
@@ -360,7 +337,6 @@ def analyze_all_images(images: list) -> str:
             f"{len(images)} görsel bulundu ancak VISION_API_KEY / AGENT1_API_KEY yok; "
             "analiz atlandı.\n"
         )
-
     limited = images[:VISION_MAX_IMAGES]
     parts = [
         "\n=== GÖRSEL ANALİZİ ===",
@@ -377,16 +353,12 @@ def analyze_all_images(images: list) -> str:
             parts.append(f"\n--- {label} ---\n{desc}")
         except Exception as e:
             parts.append(f"\n--- {label} ---\nGörsel analiz hatası: {e}")
-
     if len(images) > VISION_MAX_IMAGES:
-        parts.append(
-            f"\n(Not: {len(images) - VISION_MAX_IMAGES} görsel limit nedeniyle atlandı.)"
-        )
+        parts.append(f"\n(Not: {len(images) - VISION_MAX_IMAGES} görsel limit nedeniyle atlandı.)")
     return "\n".join(parts)
 
 
 def validate_extracted_text(name: str, content: str) -> str:
-    """Boş/çok kısa içerikte uyarı; ajanın uydurma şablon üretmesini engeller."""
     text = (content or "").strip()
     if len(text) < 20:
         return (
@@ -405,8 +377,6 @@ def call_agent(client, agent_no: int, user_content: str, max_tokens=None):
             f"{instruction}\n\n"
             f"{user_content}"
         )
-
-    # 1. ve 2. Ajan NVIDIA (OpenAI Client) Kullanır
     if agent_no in [1, 2]:
         kwargs = {
             "model": cfg["model"],
@@ -425,12 +395,9 @@ def call_agent(client, agent_no: int, user_content: str, max_tokens=None):
             kwargs["presence_penalty"] = cfg["presence_penalty"]
         if cfg.get("extra_body"):
             kwargs["extra_body"] = cfg["extra_body"]
-
         completion = client.chat.completions.create(**kwargs)
         content = completion.choices[0].message.content
         return content if content is not None else ""
-
-    # 3. Ajan Google Gemini Kullanır
     elif agent_no == 3:
         prompt_with_system = f"{AGENT_PROMPTS[3]}\n\n{user_content}"
         generation_config = genai.types.GenerationConfig(
@@ -457,15 +424,12 @@ def append_chat(role: str, content: str, agent=None):
 
 
 def render_chat_panel(agent_no: int, placeholder: str):
-    """Her adımda kullanıcının talimat yazdığı chat alanı."""
     st.subheader("Chat / Talimat")
     st.caption(
         f"Ajan {agent_no} için bu adımda ne yapılsın? Yazıların ajan çağrısına eklenir."
     )
-
     relevant = [
-        m
-        for m in st.session_state.chat_log
+        m for m in st.session_state.chat_log
         if m.get("agent") in (None, agent_no)
     ]
     if relevant:
@@ -479,7 +443,6 @@ def render_chat_panel(agent_no: int, placeholder: str):
                 st.markdown(f"**{who}:** {m['content']}")
     else:
         st.caption("Henüz mesaj yok. Aşağıya bu adım için talimatını yaz.")
-
     note_key = f"user_instruction_{agent_no}"
     st.text_area(
         "Bu adımda yapılacaklar (sen yaz)",
@@ -487,7 +450,6 @@ def render_chat_panel(agent_no: int, placeholder: str):
         key=note_key,
         placeholder=placeholder,
     )
-
     if st.button("Talimatı sohbete kaydet", key=f"save_chat_{agent_no}"):
         text = (st.session_state.get(note_key) or "").strip()
         if text:
@@ -544,6 +506,82 @@ def _report_title(agent_no: int) -> str:
     return f"Teknik Rapor (Ajan {agent_no} çıktısı)"
 
 
+# --- DOKÜMAN VE GRAFİK MOTORU (YENİ EKLENEN FONKSİYONLAR) ---
+
+def get_mermaid_image_bytes(mermaid_code: str):
+    try:
+        clean_code = "\n".join([
+            line for line in mermaid_code.splitlines() 
+            if not line.strip().startswith("```")
+        ])
+        graph_bytes = clean_code.encode("utf8")
+        base64_string = base64.b64encode(graph_bytes).decode("ascii")
+        url = f"[https://mermaid.ink/img/](https://mermaid.ink/img/){base64_string}"
+        response = requests.get(url, timeout=15)
+        if response.status_code == 200:
+            return io.BytesIO(response.content)
+    except Exception:
+        pass
+    return None
+
+
+def parse_markdown_blocks(text: str):
+    lines = (text or "").splitlines()
+    blocks = []
+    current_table = []
+    in_mermaid = False
+    mermaid_lines = []
+    
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```mermaid"):
+            in_mermaid = True
+            if current_table:
+                blocks.append(("table", current_table))
+                current_table = []
+            continue
+        elif in_mermaid and stripped.startswith("```"):
+            in_mermaid = False
+            blocks.append(("mermaid", "\n".join(mermaid_lines)))
+            mermaid_lines = []
+            continue
+        elif in_mermaid:
+            mermaid_lines.append(line)
+            continue
+        
+        if "|" in stripped and (stripped.startswith("|") or stripped.endswith("|")):
+            if "---" in stripped and set(stripped.replace("|", "").replace(":", "").strip()) == {"-"}:
+                continue
+            cells = [cell.strip() for cell in stripped.split("|")[1:-1]]
+            if cells:
+                current_table.append(cells)
+            continue
+        else:
+            if current_table:
+                blocks.append(("table", current_table))
+                current_table = []
+        
+        if not stripped:
+            blocks.append(("spacer", ""))
+            continue
+        
+        if stripped.startswith("# "):
+            blocks.append(("heading", 1, stripped[2:].strip()))
+        elif stripped.startswith("## "):
+            blocks.append(("heading", 2, stripped[3:].strip()))
+        elif stripped.startswith("### "):
+            blocks.append(("heading", 3, stripped[4:].strip()))
+        else:
+            blocks.append(("paragraph", stripped))
+            
+    if current_table:
+        blocks.append(("table", current_table))
+    if in_mermaid and mermaid_lines:
+        blocks.append(("mermaid", "\n".join(mermaid_lines)))
+        
+    return blocks
+
+
 def build_docx_bytes(report_text: str, agent_no: int) -> bytes:
     doc = Document()
     for section in doc.sections:
@@ -555,28 +593,46 @@ def build_docx_bytes(report_text: str, agent_no: int) -> bytes:
     title = doc.add_heading(_report_title(agent_no), level=0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    meta = doc.add_paragraph(
-        f"Oluşturulma: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-    )
+    meta = doc.add_paragraph(f"Oluşturulma: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
     doc.add_paragraph("")
 
-    for line in (report_text or "").splitlines():
-        stripped = line.strip()
-        if not stripped:
-            doc.add_paragraph("")
-            continue
-        if stripped.startswith("### "):
-            doc.add_heading(stripped[4:], level=3)
-        elif stripped.startswith("## "):
-            doc.add_heading(stripped[3:], level=2)
-        elif stripped.startswith("# "):
-            doc.add_heading(stripped[2:], level=1)
-        else:
-            p = doc.add_paragraph(stripped)
+    blocks = parse_markdown_blocks(report_text)
+    for block in blocks:
+        block_type = block[0]
+        if block_type == "heading":
+            doc.add_heading(block[2], level=min(block[1], 3))
+        elif block_type == "paragraph":
+            p = doc.add_paragraph(block[1])
             for run in p.runs:
                 run.font.size = Pt(11)
+        elif block_type == "spacer":
+            doc.add_paragraph("")
+        elif block_type == "table":
+            rows = block[1]
+            if not rows:
+                continue
+            max_cols = max(len(r) for r in rows)
+            table = doc.add_table(rows=len(rows), cols=max_cols)
+            table.style = 'Table Grid'
+            for r_idx, row in enumerate(rows):
+                for c_idx in range(max_cols):
+                    cell = table.cell(r_idx, c_idx)
+                    cell_value = row[c_idx] if c_idx < len(row) else ""
+                    cell.text = cell_value
+                    if r_idx == 0:
+                        for paragraph in cell.paragraphs:
+                            for run in paragraph.runs:
+                                run.font.bold = True
+            doc.add_paragraph("")
+        elif block_type == "mermaid":
+            img_stream = get_mermaid_image_bytes(block[1])
+            if img_stream:
+                doc.add_picture(img_stream, width=Cm(14))
+                doc.add_paragraph("")
+            else:
+                p = doc.add_paragraph(f"[Görsel Çizilemedi - Kod]:\n{block[1]}")
+                p.style = 'Intense Quote'
 
     buffer = io.BytesIO()
     doc.save(buffer)
@@ -589,13 +645,25 @@ def _register_pdf_font() -> str:
         (r"C:\Windows\Fonts\arial.ttf", "ArialTR"),
         (r"C:\Windows\Fonts\calibri.ttf", "CalibriTR"),
         ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "DejaVu"),
+        ("Roboto-Regular.ttf", "RobotoTR")
     ]
     for path, name in candidates:
-        try:
-            pdfmetrics.registerFont(TTFont(name, path))
-            return name
-        except Exception:
-            continue
+        if os.path.exists(path):
+            try:
+                pdfmetrics.registerFont(TTFont(name, path))
+                return name
+            except Exception:
+                continue
+    try:
+        url = "[https://github.com/google/fonts/raw/main/apache/roboto/Roboto-Regular.ttf](https://github.com/google/fonts/raw/main/apache/roboto/Roboto-Regular.ttf)"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            with open("Roboto-Regular.ttf", "wb") as f:
+                f.write(resp.content)
+            pdfmetrics.registerFont(TTFont("RobotoTR", "Roboto-Regular.ttf"))
+            return "RobotoTR"
+    except Exception:
+        pass
     return "Helvetica"
 
 
@@ -603,85 +671,81 @@ def build_pdf_bytes(report_text: str, agent_no: int) -> bytes:
     font_name = _register_pdf_font()
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        leftMargin=2 * cm,
-        rightMargin=2 * cm,
-        topMargin=2 * cm,
-        bottomMargin=2 * cm,
+        buffer, pagesize=A4,
+        leftMargin=2 * cm, rightMargin=2 * cm,
+        topMargin=2 * cm, bottomMargin=2 * cm
     )
 
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "ReportTitle",
-        parent=styles["Heading1"],
-        fontName=font_name,
-        fontSize=16,
-        spaceAfter=8,
-        alignment=1,
-    )
-    meta_style = ParagraphStyle(
-        "ReportMeta",
-        parent=styles["Normal"],
-        fontName=font_name,
-        fontSize=9,
-        spaceAfter=16,
-        alignment=1,
-    )
-    body_style = ParagraphStyle(
-        "ReportBody",
-        parent=styles["Normal"],
-        fontName=font_name,
-        fontSize=11,
-        leading=15,
-        spaceAfter=6,
-    )
-    h1_style = ParagraphStyle(
-        "ReportH1",
-        parent=styles["Heading1"],
-        fontName=font_name,
-        fontSize=14,
-        spaceBefore=12,
-        spaceAfter=6,
-    )
-    h2_style = ParagraphStyle(
-        "ReportH2",
-        parent=styles["Heading2"],
-        fontName=font_name,
-        fontSize=12,
-        spaceBefore=10,
-        spaceAfter=4,
-    )
+    title_style = ParagraphStyle("RepTitle", parent=styles["Heading1"], fontName=font_name, fontSize=16, spaceAfter=8, alignment=1)
+    meta_style = ParagraphStyle("RepMeta", parent=styles["Normal"], fontName=font_name, fontSize=9, spaceAfter=16, alignment=1)
+    body_style = ParagraphStyle("RepBody", parent=styles["Normal"], fontName=font_name, fontSize=10, leading=14, spaceAfter=6)
+    h1_style = ParagraphStyle("RepH1", parent=styles["Heading1"], fontName=font_name, fontSize=13, spaceBefore=12, spaceAfter=6)
+    h2_style = ParagraphStyle("RepH2", parent=styles["Heading2"], fontName=font_name, fontSize=11, spaceBefore=10, spaceAfter=4)
+    h3_style = ParagraphStyle("RepH3", parent=styles["Heading3"], fontName=font_name, fontSize=10.5, spaceBefore=8, spaceAfter=4)
+    cell_style = ParagraphStyle("RepCell", parent=styles["Normal"], fontName=font_name, fontSize=8.5, leading=11)
+    header_cell_style = ParagraphStyle("RepHeaderCell", parent=styles["Normal"], fontName=font_name, fontSize=8.5, leading=11, textColor=colors.white)
 
     def esc(text: str) -> str:
-        return (
-            text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-        )
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     story = [
         Paragraph(esc(_report_title(agent_no)), title_style),
-        Paragraph(
-            esc(f"Oluşturulma: {datetime.now().strftime('%d.%m.%Y %H:%M')}"),
-            meta_style,
-        ),
+        Paragraph(esc(f"Oluşturulma: {datetime.now().strftime('%d.%m.%Y %H:%M')}"), meta_style),
         Spacer(1, 0.3 * cm),
     ]
 
-    for line in (report_text or "").splitlines():
-        stripped = line.strip()
-        if not stripped:
+    blocks = parse_markdown_blocks(report_text)
+    for block in blocks:
+        block_type = block[0]
+        if block_type == "heading":
+            level, text = block[1], block[2]
+            style_map = {1: h1_style, 2: h2_style, 3: h3_style}
+            story.append(Paragraph(esc(text), style_map.get(level, h2_style)))
+        elif block_type == "paragraph":
+            story.append(Paragraph(esc(block[1]), body_style))
+        elif block_type == "spacer":
             story.append(Spacer(1, 0.25 * cm))
-            continue
-        if stripped.startswith("### "):
-            story.append(Paragraph(esc(stripped[4:]), h2_style))
-        elif stripped.startswith("## "):
-            story.append(Paragraph(esc(stripped[3:]), h2_style))
-        elif stripped.startswith("# "):
-            story.append(Paragraph(esc(stripped[2:]), h1_style))
-        else:
-            story.append(Paragraph(esc(stripped), body_style))
+        elif block_type == "table":
+            rows = block[1]
+            if not rows:
+                continue
+            max_cols = max(len(r) for r in rows)
+            col_width = (17 * cm) / max_cols
+            table_data = []
+            for r_idx, row in enumerate(rows):
+                formatted_row = []
+                for c_idx in range(max_cols):
+                    val = row[c_idx] if c_idx < len(row) else ""
+                    if r_idx == 0:
+                        formatted_row.append(Paragraph(f"<b>{esc(val)}</b>", header_cell_style))
+                    else:
+                        formatted_row.append(Paragraph(esc(val), cell_style))
+                table_data.append(formatted_row)
+            t = Table(table_data, colWidths=[col_width] * max_cols)
+            t.setStyle(TableStyle([
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#2C3E50")),
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('TOPPADDING', (0, 0), (-1, -1), 5),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+            ]))
+            story.append(t)
+            story.append(Spacer(1, 0.3 * cm))
+        elif block_type == "mermaid":
+            img_stream = get_mermaid_image_bytes(block[1])
+            if img_stream:
+                try:
+                    img = RLImage(img_stream)
+                    aspect = img.imageHeight / float(img.imageWidth)
+                    img.drawWidth = 14 * cm
+                    img.drawHeight = (14 * cm) * aspect
+                    story.append(img)
+                    story.append(Spacer(1, 0.3 * cm))
+                except Exception:
+                    story.append(Paragraph("[Görsel işlenemedi]", body_style))
+            else:
+                story.append(Paragraph(f"<i>[Akış Şeması]:</i><br/>{esc(block[1])}", body_style))
 
     doc.build(story)
     buffer.seek(0)
@@ -702,14 +766,12 @@ def show_progress():
                 st.caption(label)
 
 
+# --- ARAYÜZ VE ADIMLAR ---
 show_progress()
 
-# --- ADIM 1: DOSYA YÜKLEME + CHAT ---
 if st.session_state.current_step == 1:
     st.header("Adım 1: Kaynak Dosyaların Yüklenmesi")
-    st.caption(
-        "Ham veri önce 1. ajana gider. Solda dosya yükle, sağda bu adımda ne yapılacağını yaz."
-    )
+    st.caption("Ham veri önce 1. ajana gider. Solda dosya yükle, sağda bu adımda ne yapılacağını yaz.")
 
     left, right = st.columns([1.2, 1])
     with left:
@@ -720,30 +782,21 @@ if st.session_state.current_step == 1:
             help="Word içindeki gömülü resimler de otomatik incelenir.",
         )
     with right:
-        render_chat_panel(
-            1,
-            "Örn: Tekrarları sil, tabloları düzenle, görsellerdeki puanları da dahil et...",
-        )
+        render_chat_panel(1, "Örn: Tekrarları sil, tabloları düzenle, görsellerdeki puanları da dahil et...")
 
     if uploaded_files and st.button("Dosyaları İşle ve 1. Ajanı Çalıştır"):
         client = init_nvidia_client(1)
         if client:
-            with st.spinner(
-                "Dosyalar ve görseller okunuyor, vision + 1. ajan çalışıyor..."
-            ):
+            with st.spinner("Dosyalar ve görseller okunuyor, vision + 1. ajan çalışıyor..."):
                 combined = []
                 all_images = []
                 for file in uploaded_files:
                     name = file.name.lower()
                     if name.endswith(".xlsx"):
-                        content = validate_extracted_text(
-                            file.name, parse_excel(file)
-                        )
+                        content = validate_extracted_text(file.name, parse_excel(file))
                         combined.append(f"\n--- {file.name} (Excel) ---\n{content}")
                     elif name.endswith(".docx"):
-                        content = validate_extracted_text(
-                            file.name, parse_docx(file)
-                        )
+                        content = validate_extracted_text(file.name, parse_docx(file))
                         combined.append(f"\n--- {file.name} (Word) ---\n{content}")
                         all_images.extend(extract_images_from_docx(file))
                     elif name.endswith((".png", ".jpg", ".jpeg", ".webp")):
@@ -755,9 +808,7 @@ if st.session_state.current_step == 1:
 
                 vision_text = ""
                 if all_images:
-                    with st.status(
-                        f"{len(all_images)} görsel inceleniyor...", expanded=True
-                    ) as status:
+                    with st.status(f"{len(all_images)} görsel inceleniyor...", expanded=True) as status:
                         vision_text = analyze_all_images(all_images)
                         st.session_state.image_analyses = [
                             {"label": img["label"], "mime": img["mime"]}
@@ -791,49 +842,25 @@ if st.session_state.current_step == 1:
                     append_chat("user", instr, agent=1)
 
                 try:
-                    output = call_agent(
-                        client,
-                        1,
-                        f"Yapılandırılacak Ham Veri:\n{raw_data}",
-                    )
+                    output = call_agent(client, 1, f"Yapılandırılacak Ham Veri:\n{raw_data}")
                     st.session_state.agent1_output = output
-                    append_chat(
-                        "assistant",
-                        output[:1500] + ("..." if len(output) > 1500 else ""),
-                        agent=1,
-                    )
+                    append_chat("assistant", output[:1500] + ("..." if len(output) > 1500 else ""), agent=1)
                     st.session_state.current_step = 2
                     st.rerun()
                 except Exception as e:
                     st.error(f"API çağrısı sırasında hata: {e}")
 
-# --- ADIM 2: 1. AJAN ÇIKTISI + CHAT (2. ajan talimatı) ---
 elif st.session_state.current_step == 2:
     st.header("Adım 2: 1. Ajan Çıktısı")
-    st.info(
-        "1. ajan çıktısını kontrol et. 2. ajana gitmeden önce sağdaki chate "
-        "analiz talimatını yazabilirsin."
-    )
+    st.info("1. ajan çıktısını kontrol et. 2. ajana gitmeden önce sağdaki chate analiz talimatını yazabilirsin.")
 
     left, right = st.columns([1.2, 1])
     with left:
         with st.expander("Ham kaynak veri (önizleme)", expanded=False):
-            st.text(
-                st.session_state.raw_data[:4000]
-                + ("..." if len(st.session_state.raw_data or "") > 4000 else "")
-            )
-
-        edited_a1 = st.text_area(
-            "1. Ajan çıktısı (düzenlenebilir)",
-            value=st.session_state.agent1_output or "",
-            height=400,
-            key="edit_agent1",
-        )
+            st.text(st.session_state.raw_data[:4000] + ("..." if len(st.session_state.raw_data or "") > 4000 else ""))
+        edited_a1 = st.text_area("1. Ajan çıktısı (düzenlenebilir)", value=st.session_state.agent1_output or "", height=400, key="edit_agent1")
     with right:
-        render_chat_panel(
-            2,
-            "Örn: Anomalilere odaklan, aylık trendleri çıkar, kritik eşikleri işaretle... (DeepSeek)",
-        )
+        render_chat_panel(2, "Örn: Anomalilere odaklan, aylık trendleri çıkar, kritik eşikleri işaretle... (DeepSeek)")
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -854,28 +881,18 @@ elif st.session_state.current_step == 2:
                     if instr:
                         append_chat("user", instr, agent=2)
                     try:
-                        prompt = build_agent2_prompt(
-                            st.session_state.raw_data,
-                            st.session_state.agent1_output,
-                        )
+                        prompt = build_agent2_prompt(st.session_state.raw_data, st.session_state.agent1_output)
                         output = call_agent(client, 2, prompt)
                         st.session_state.agent2_output = output
-                        append_chat(
-                            "assistant",
-                            output[:1500] + ("..." if len(output) > 1500 else ""),
-                            agent=2,
-                        )
+                        append_chat("assistant", output[:1500] + ("..." if len(output) > 1500 else ""), agent=2)
                         st.session_state.current_step = 3
                         st.rerun()
                     except Exception as e:
                         st.error(f"API çağrısı sırasında hata: {e}")
 
-# --- ADIM 3: 2. AJAN ÇIKTISI + CHAT (3. ajan talimatı) ---
 elif st.session_state.current_step == 3:
     st.header("Adım 3: 2. Ajan Çıktısı")
-    st.info(
-        "2. ajan çıktısını kontrol et. 3. ajana (Gemini) gitmeden önce nihai rapor talimatını yaz."
-    )
+    st.info("2. ajan çıktısını kontrol et. 3. ajana (Gemini) gitmeden önce nihai rapor talimatını yaz.")
 
     left, right = st.columns([1.2, 1])
     with left:
@@ -884,18 +901,9 @@ elif st.session_state.current_step == 3:
             st.text((st.session_state.raw_data or "")[:2000])
             st.markdown("**1. ajan çıktısı**")
             st.text(st.session_state.agent1_output or "")
-
-        edited_a2 = st.text_area(
-            "2. Ajan çıktısı (düzenlenebilir)",
-            value=st.session_state.agent2_output or "",
-            height=400,
-            key="edit_agent2",
-        )
+        edited_a2 = st.text_area("2. Ajan çıktısı (düzenlenebilir)", value=st.session_state.agent2_output or "", height=400, key="edit_agent2")
     with right:
-        render_chat_panel(
-            3,
-            "Örn: Yönetici özeti yaz, riskleri maddele, net tablolar kullan... (Gemini)",
-        )
+        render_chat_panel(3, "Örn: Yönetici özeti yaz, riskleri maddele, net tablolar kullan... (Gemini)")
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -911,37 +919,23 @@ elif st.session_state.current_step == 3:
             st.session_state.agent2_output = edited_a2
             client = init_gemini_client()
             if client:
-                with st.spinner(
-                    "3. Ajan (Gemini) tablo ve şemalarla nihai raporu yazıyor..."
-                ):
+                with st.spinner("3. Ajan (Gemini) tablo ve şemalarla nihai raporu yazıyor..."):
                     instr = (st.session_state.user_instruction_3 or "").strip()
                     if instr:
                         append_chat("user", instr, agent=3)
                     try:
-                        prompt = build_agent3_prompt(
-                            st.session_state.raw_data,
-                            st.session_state.agent1_output,
-                            st.session_state.agent2_output,
-                        )
+                        prompt = build_agent3_prompt(st.session_state.raw_data, st.session_state.agent1_output, st.session_state.agent2_output)
                         output = call_agent(client, 3, prompt)
                         st.session_state.agent3_output = output
-                        append_chat(
-                            "assistant",
-                            output[:1500] + ("..." if len(output) > 1500 else ""),
-                            agent=3,
-                        )
+                        append_chat("assistant", output[:1500] + ("..." if len(output) > 1500 else ""), agent=3)
                         st.session_state.current_step = 4
                         st.rerun()
                     except Exception as e:
                         st.error(f"Gemini API çağrısı sırasında hata: {e}")
 
-# --- ADIM 4: 3. AJAN ÇIKTISI ---
 elif st.session_state.current_step == 4:
     st.header("Adım 4: 3. Ajan (Gemini) Çıktısı")
-    st.warning(
-        "3. ajan ham veri + 1. ajan + 2. ajan çıktılarını birleştirdi. "
-        "Düzenleyip sonuçlandırın."
-    )
+    st.warning("3. ajan ham veri + 1. ajan + 2. ajan çıktılarını birleştirdi. Düzenleyip sonuçlandırın.")
 
     with st.expander("Girdi özeti", expanded=False):
         st.markdown("**Ham veri** (kısaltılmış)")
@@ -951,12 +945,7 @@ elif st.session_state.current_step == 4:
         st.markdown("**2. ajan**")
         st.text(st.session_state.agent2_output or "")
 
-    edited_a3 = st.text_area(
-        "3. Ajan çıktısı (düzenlenebilir)",
-        value=st.session_state.agent3_output or "",
-        height=400,
-        key="edit_agent3",
-    )
+    edited_a3 = st.text_area("3. Ajan çıktısı (düzenlenebilir)", value=st.session_state.agent3_output or "", height=400, key="edit_agent3")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -968,7 +957,6 @@ elif st.session_state.current_step == 4:
             st.session_state.agent3_output = edited_a3
             finalize_with(edited_a3, 3)
 
-# --- ADIM 5: SONUÇ ---
 elif st.session_state.current_step == 5:
     st.header("Nihai Sonuç")
     finished = st.session_state.finalized_at
@@ -978,12 +966,7 @@ elif st.session_state.current_step == 5:
     stamp = datetime.now().strftime("%Y%m%d_%H%M")
     base_name = f"rapor_ajan{finished}_{stamp}"
 
-    st.text_area(
-        "Nihai rapor (Düzenleme Ekranı)",
-        value=report_text,
-        height=300,
-        key="final_view",
-    )
+    st.text_area("Nihai rapor (Düzenleme Ekranı)", value=report_text, height=300, key="final_view")
     
     st.subheader("Görsel Rapor Önizlemesi (Tablo ve Şema Desteği ile)")
     st.markdown(report_text, unsafe_allow_html=True)
