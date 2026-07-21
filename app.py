@@ -2,6 +2,7 @@ import os
 import io
 import base64
 import requests
+import re
 from datetime import datetime
 import streamlit as st
 import pandas as pd
@@ -525,19 +526,26 @@ def _report_title(agent_no: int) -> str:
 # --- DOKÜMAN VE GRAFİK MOTORU (YENİ EKLENEN FONKSİYONLAR) ---
 
 def get_mermaid_image_bytes(mermaid_code: str):
+    """Mermaid kodunu doğrudan POST ederek kroki.io üzerinden PNG'ye çevirir."""
     try:
         clean_code = "\n".join([
             line for line in mermaid_code.splitlines() 
             if not line.strip().startswith("```")
-        ])
-        graph_bytes = clean_code.encode("utf8")
-        base64_string = base64.b64encode(graph_bytes).decode("ascii")
-        url = f"[https://mermaid.ink/img/](https://mermaid.ink/img/){base64_string}"
-        response = requests.get(url, timeout=15)
+        ]).strip()
+        
+        if not clean_code:
+            return None
+
+        response = requests.post(
+            "[https://kroki.io/mermaid/png](https://kroki.io/mermaid/png)", 
+            data=clean_code.encode('utf-8'),
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+            timeout=15
+        )
         if response.status_code == 200:
             return io.BytesIO(response.content)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Grafik hatası: {e}")
     return None
 
 
@@ -598,6 +606,38 @@ def parse_markdown_blocks(text: str):
     return blocks
 
 
+def add_markdown_runs(paragraph, text: str, default_size=11, is_bold_override=False):
+    """Metin içindeki **kalın** ve *italik* Markdown işaretlerini Word stilinde işler."""
+    if not text:
+        return
+        
+    parts = re.split(r'(\*\*.*?\*\*)', text)
+    for part in parts:
+        if not part:
+            continue
+            
+        if part.startswith('**') and part.endswith('**') and len(part) >= 4:
+            run = paragraph.add_run(part[2:-2])
+            run.bold = True
+            run.font.size = Pt(default_size)
+        else:
+            subparts = re.split(r'(\*.*?\*)', part)
+            for subpart in subparts:
+                if not subpart:
+                    continue
+                if subpart.startswith('*') and subpart.endswith('*') and len(subpart) >= 2:
+                    run = paragraph.add_run(subpart[1:-1])
+                    run.italic = True
+                    run.font.size = Pt(default_size)
+                    if is_bold_override:
+                        run.bold = True
+                else:
+                    run = paragraph.add_run(subpart)
+                    run.font.size = Pt(default_size)
+                    if is_bold_override:
+                        run.bold = True
+
+
 def build_docx_bytes(report_text: str, agent_no: int) -> bytes:
     doc = Document()
     for section in doc.sections:
@@ -616,14 +656,19 @@ def build_docx_bytes(report_text: str, agent_no: int) -> bytes:
     blocks = parse_markdown_blocks(report_text)
     for block in blocks:
         block_type = block[0]
+        
         if block_type == "heading":
-            doc.add_heading(block[2], level=min(block[1], 3))
+            clean_heading = re.sub(r'\*\*(.*?)\*\*', r'\1', block[2])
+            clean_heading = re.sub(r'\*(.*?)\*', r'\1', clean_heading)
+            doc.add_heading(clean_heading, level=min(block[1], 3))
+            
         elif block_type == "paragraph":
-            p = doc.add_paragraph(block[1])
-            for run in p.runs:
-                run.font.size = Pt(11)
+            p = doc.add_paragraph()
+            add_markdown_runs(p, block[1], default_size=11)
+            
         elif block_type == "spacer":
             doc.add_paragraph("")
+            
         elif block_type == "table":
             rows = block[1]
             if not rows:
@@ -631,16 +676,22 @@ def build_docx_bytes(report_text: str, agent_no: int) -> bytes:
             max_cols = max(len(r) for r in rows)
             table = doc.add_table(rows=len(rows), cols=max_cols)
             table.style = 'Table Grid'
+            
             for r_idx, row in enumerate(rows):
                 for c_idx in range(max_cols):
                     cell = table.cell(r_idx, c_idx)
+                    cell.text = "" 
                     cell_value = row[c_idx] if c_idx < len(row) else ""
-                    cell.text = cell_value
+                    
+                    p = cell.paragraphs[0]
                     if r_idx == 0:
-                        for paragraph in cell.paragraphs:
-                            for run in paragraph.runs:
-                                run.font.bold = True
+                        clean_val = re.sub(r'\*\*(.*?)\*\*', r'\1', cell_value)
+                        add_markdown_runs(p, clean_val, default_size=9.5, is_bold_override=True)
+                    else:
+                        add_markdown_runs(p, cell_value, default_size=9.5)
+                        
             doc.add_paragraph("")
+            
         elif block_type == "mermaid":
             img_stream = get_mermaid_image_bytes(block[1])
             if img_stream:
@@ -657,30 +708,36 @@ def build_docx_bytes(report_text: str, agent_no: int) -> bytes:
 
 
 def _register_pdf_font() -> str:
-    candidates = [
-        (r"C:\Windows\Fonts\arial.ttf", "ArialTR"),
-        (r"C:\Windows\Fonts\calibri.ttf", "CalibriTR"),
-        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "DejaVu"),
-        ("Roboto-Regular.ttf", "RobotoTR")
+    font_name = "DejaVuTR"
+    font_filename = "DejaVuSans.ttf"
+    
+    local_paths = [
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\calibri.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        font_filename
     ]
-    for path, name in candidates:
+    
+    for path in local_paths:
         if os.path.exists(path):
             try:
-                pdfmetrics.registerFont(TTFont(name, path))
-                return name
+                pdfmetrics.registerFont(TTFont(font_name, path, 'UTF-8'))
+                return font_name
             except Exception:
                 continue
+                
     try:
-        url = "[https://github.com/google/fonts/raw/main/apache/roboto/Roboto-Regular.ttf](https://github.com/google/fonts/raw/main/apache/roboto/Roboto-Regular.ttf)"
+        url = "[https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSans.ttf](https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSans.ttf)"
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
-            with open("Roboto-Regular.ttf", "wb") as f:
+            with open(font_filename, "wb") as f:
                 f.write(resp.content)
-            pdfmetrics.registerFont(TTFont("RobotoTR", "Roboto-Regular.ttf"))
-            return "RobotoTR"
+            pdfmetrics.registerFont(TTFont(font_name, font_filename, 'UTF-8'))
+            return font_name
     except Exception:
         pass
-    return "Helvetica"
+        
+    return "Helvetica" 
 
 
 def build_pdf_bytes(report_text: str, agent_no: int) -> bytes:
@@ -754,12 +811,13 @@ def build_pdf_bytes(report_text: str, agent_no: int) -> bytes:
                 try:
                     img = RLImage(img_stream)
                     aspect = img.imageHeight / float(img.imageWidth)
-                    img.drawWidth = 14 * cm
-                    img.drawHeight = (14 * cm) * aspect
+                    draw_w = min(14 * cm, 17 * cm)
+                    img.drawWidth = draw_w
+                    img.drawHeight = draw_w * aspect
                     story.append(img)
                     story.append(Spacer(1, 0.3 * cm))
                 except Exception:
-                    story.append(Paragraph("[Görsel işlenemedi]", body_style))
+                    story.append(Paragraph("[Görsel PDF formatına dönüştürülemedi]", body_style))
             else:
                 story.append(Paragraph(f"<i>[Akış Şeması]:</i><br/>{esc(block[1])}", body_style))
 
