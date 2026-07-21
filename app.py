@@ -777,7 +777,7 @@ if st.session_state.current_step == 1:
     with left:
         uploaded_files = st.file_uploader(
             "Excel / Word / görsel dosyaları seçin",
-            type=["xlsx", "docx", "png", "jpg", "jpeg", "webp"],
+            type=["xlsx", "docx", "png", "jpg", "jpeg", "webp", "pdf"],
             accept_multiple_files=True,
             help="Word içindeki gömülü resimler de otomatik incelenir.",
         )
