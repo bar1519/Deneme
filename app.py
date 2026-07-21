@@ -17,6 +17,7 @@ from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle, Image as RLImage
+import pypdf  # PDF metin okuma kütüphanesi
 
 # --- SAYFA YAPILANDIRMASI ---
 st.set_page_config(
@@ -234,6 +235,21 @@ def parse_docx(file):
             if any(cells):
                 parts.append(" | ".join(cells))
     return "\n".join(parts).strip()
+
+
+def parse_pdf(file):
+    file.seek(0)
+    try:
+        reader = pypdf.PdfReader(file)
+        parts = []
+        for i, page in enumerate(reader.pages):
+            parts.append(f"\n--- Sayfa {i+1} ---")
+            text = page.extract_text()
+            if text:
+                parts.append(text.strip())
+        return "\n".join(parts).strip()
+    except Exception as e:
+        return f"PDF okunurken hata oluştu: {str(e)}"
 
 
 def _guess_mime(name: str, content_type: str = "") -> str:
@@ -776,7 +792,7 @@ if st.session_state.current_step == 1:
     left, right = st.columns([1.2, 1])
     with left:
         uploaded_files = st.file_uploader(
-            "Excel / Word / görsel dosyaları seçin",
+            "Excel / Word / PDF / görsel dosyaları seçin",
             type=["xlsx", "docx", "png", "jpg", "jpeg", "webp", "pdf"],
             accept_multiple_files=True,
             help="Word içindeki gömülü resimler de otomatik incelenir.",
@@ -799,6 +815,9 @@ if st.session_state.current_step == 1:
                         content = validate_extracted_text(file.name, parse_docx(file))
                         combined.append(f"\n--- {file.name} (Word) ---\n{content}")
                         all_images.extend(extract_images_from_docx(file))
+                    elif name.endswith(".pdf"):
+                        content = validate_extracted_text(file.name, parse_pdf(file))
+                        combined.append(f"\n--- {file.name} (PDF) ---\n{content}")
                     elif name.endswith((".png", ".jpg", ".jpeg", ".webp")):
                         all_images.append(collect_uploaded_image(file))
                         combined.append(
@@ -831,7 +850,7 @@ if st.session_state.current_step == 1:
                 if only_empty_docs or len(raw_data) < 40:
                     st.error(
                         "Dosya/görsel içeriği okunamadı veya boş. "
-                        "Word tabloları ve gömülü resimler desteklenir; "
+                        "Word, PDF tabloları ve gömülü resimler desteklenir; "
                         "ayrıca png/jpg yükleyebilirsiniz."
                     )
                     st.code(raw_data[:2000] if raw_data else "(boş)")
